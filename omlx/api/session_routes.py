@@ -12,10 +12,9 @@ Endpoints:
 - DELETE /v1/sessions/{id}         — Delete session
 """
 
-import asyncio
+import json as _json
 import logging
 import time
-import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request as FastAPIRequest
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
-# Dependency injection callbacks (set by server.py)
+# Dependency injection callbacks (set by server.py in configure_server)
 _get_session_manager = None
 _get_engine_pool = None
 _get_engine_for_model = None
@@ -39,7 +38,6 @@ def set_session_getters(
     engine_for_model_getter,
     server_state_getter,
 ):
-    """Set callback functions for dependency injection."""
     global _get_session_manager, _get_engine_pool
     global _get_engine_for_model, _get_server_state
     _get_session_manager = session_manager_getter
@@ -116,17 +114,13 @@ class SessionListResponse(BaseModel):
 
 @router.post("", response_model=CreateSessionResponse)
 async def create_session(request: CreateSessionRequest):
-    """Create a new session."""
     mgr = _mgr()
-
-    # Resolve model name
     model_name = request.model
     if model_name is None:
         state = _get_server_state()
         model_name = state.default_model
     if not model_name:
         raise HTTPException(400, "No model specified and no default model configured")
-
     try:
         manifest = mgr.create_session(
             model_name=model_name,
@@ -135,7 +129,6 @@ async def create_session(request: CreateSessionRequest):
         )
     except ValueError as e:
         raise HTTPException(409, str(e))
-
     return CreateSessionResponse(
         session_id=manifest.session_id,
         model=manifest.model_name,
@@ -145,7 +138,6 @@ async def create_session(request: CreateSessionRequest):
 
 @router.get("", response_model=SessionListResponse)
 async def list_sessions():
-    """List all sessions."""
     mgr = _mgr()
     sessions = []
     for m in mgr.list_sessions():
@@ -169,7 +161,6 @@ async def list_sessions():
 
 @router.get("/{session_id}", response_model=SessionInfo)
 async def get_session(session_id: str):
-    """Get session details."""
     mgr = _mgr()
     m = mgr.get_session(session_id)
     if m is None:
@@ -194,88 +185,63 @@ async def session_chat(
     request: SessionChatRequest,
     http_request: FastAPIRequest,
 ):
-    """Chat within a session. KV cache is retained between turns."""
     mgr = _mgr()
     manifest = mgr.get_session(session_id)
     if manifest is None:
         raise HTTPException(404, f"Session {session_id} not found")
     if manifest.state.value == "parked":
-        raise HTTPException(
-            409, "Session is parked. POST /v1/sessions/{id}/resume first."
-        )
+        raise HTTPException(409, "Session is parked. POST /v1/sessions/{id}/resume first.")
     if manifest.state.value in ("parking", "resuming"):
-        raise HTTPException(
-            409, f"Session is {manifest.state.value}. Try again shortly."
-        )
+        raise HTTPException(409, f"Session is {manifest.state.value}. Try again shortly.")
 
     # Acquire per-session lock (sequential turns)
     lock = mgr.acquire_session_lock(session_id)
     try:
-        return await _do_session_chat(
-            mgr, manifest, request, http_request
-        )
+        return await _do_session_chat(mgr, manifest, request, http_request)
     finally:
         lock.release()
 
 
 async def _do_session_chat(mgr, manifest, request, http_request):
-    """Internal session chat handler."""
-    # Get engine for the session's model
+    """Session chat using engine's public API."""
     engine = await _get_engine_for_model(manifest.model_name)
-
-    # Messages are already list[dict] from the request
     messages = request.messages
 
-    # Apply chat template to get prompt
-    chat_template_kwargs = {}
-    if request.tools:
-        chat_template_kwargs["tools"] = request.tools
-    prompt = engine._apply_chat_template(
-        messages, **chat_template_kwargs
-    )
-
-    # Build kwargs for engine
-    chat_kwargs = {}
+    # Build kwargs for engine.chat() / engine.stream_chat()
+    kwargs = {"session_id": manifest.session_id}
     if request.temperature is not None:
-        chat_kwargs["temperature"] = request.temperature
+        kwargs["temperature"] = request.temperature
     if request.top_p is not None:
-        chat_kwargs["top_p"] = request.top_p
+        kwargs["top_p"] = request.top_p
     if request.top_k is not None:
-        chat_kwargs["top_k"] = request.top_k
+        kwargs["top_k"] = request.top_k
     if request.min_p is not None:
-        chat_kwargs["min_p"] = request.min_p
+        kwargs["min_p"] = request.min_p
     if request.max_tokens is not None:
-        chat_kwargs["max_tokens"] = request.max_tokens
+        kwargs["max_tokens"] = request.max_tokens
     if request.repetition_penalty is not None:
-        chat_kwargs["repetition_penalty"] = request.repetition_penalty
+        kwargs["repetition_penalty"] = request.repetition_penalty
     if request.presence_penalty is not None:
-        chat_kwargs["presence_penalty"] = request.presence_penalty
+        kwargs["presence_penalty"] = request.presence_penalty
     if request.frequency_penalty is not None:
-        chat_kwargs["frequency_penalty"] = request.frequency_penalty
+        kwargs["frequency_penalty"] = request.frequency_penalty
     if request.stop:
-        chat_kwargs["stop"] = request.stop
-
-    # Inject session_id so scheduler retains KV
-    chat_kwargs["session_id"] = manifest.session_id
+        kwargs["stop"] = request.stop
 
     if request.stream:
         return StreamingResponse(
-            _stream_session_chat(engine, prompt, chat_kwargs, manifest, mgr, messages),
+            _stream_session_chat(engine, messages, kwargs, manifest, mgr, request.tools),
             media_type="text/event-stream",
         )
 
-    # Non-streaming
-    output = await engine.generate(prompt=prompt, **chat_kwargs)
+    # Non-streaming: use engine.chat()
+    output = await engine.chat(messages=messages, tools=request.tools, **kwargs)
 
-    # Update session messages
-    updated_messages = list(messages) + [
+    # Update session messages for introspection
+    manifest.messages = list(messages) + [
         {"role": "assistant", "content": output.text}
     ]
-    # Note: manifest is updated by scheduler via update_after_generation
-    # We just update messages here for introspection
-    manifest.messages = updated_messages
 
-    # Re-read manifest for updated stats
     m = mgr.get_session(manifest.session_id)
     return SessionChatResponse(
         session_id=manifest.session_id,
@@ -291,22 +257,20 @@ async def _do_session_chat(mgr, manifest, request, http_request):
     )
 
 
-async def _stream_session_chat(
-    engine, prompt, chat_kwargs, manifest, mgr, messages
-):
-    """SSE streaming for session chat."""
-    import json as _json
-
+async def _stream_session_chat(engine, messages, kwargs, manifest, mgr, tools=None):
+    """SSE streaming for session chat, delegating to engine.stream_chat()."""
     full_text = ""
+    last_chunk = None
     try:
-        async for chunk in engine.stream_generate(prompt=prompt, **chat_kwargs):
-            full_text += chunk.text
+        async for chunk in engine.stream_chat(messages=messages, tools=tools, **kwargs):
+            full_text += chunk.new_text
             data = {
                 "session_id": manifest.session_id,
-                "content": chunk.text,
+                "content": chunk.new_text,
                 "finished": chunk.finished,
             }
             if chunk.finished:
+                last_chunk = chunk
                 data["finish_reason"] = chunk.finish_reason
                 data["usage"] = {
                     "prompt_tokens": chunk.prompt_tokens,
@@ -333,7 +297,6 @@ async def _stream_session_chat(
 
 @router.post("/{session_id}/park")
 async def park_session(session_id: str):
-    """Park session: move KV from memory to SSD."""
     mgr = _mgr()
     manifest = mgr.get_session(session_id)
     if manifest is None:
@@ -341,7 +304,6 @@ async def park_session(session_id: str):
     if manifest.state.value != "active":
         raise HTTPException(409, f"Session is {manifest.state.value}, cannot park")
 
-    # Get the store_cache function from the scheduler
     engine = await _get_engine_for_model(manifest.model_name)
     scheduler = engine._engine.engine.scheduler
     if scheduler.block_aware_cache is None:
@@ -351,13 +313,11 @@ async def park_session(session_id: str):
     success = mgr.park_session(session_id, store_fn)
     if not success:
         raise HTTPException(500, "Park failed")
-
     return {"session_id": session_id, "state": "parked"}
 
 
 @router.post("/{session_id}/resume")
 async def resume_session(session_id: str):
-    """Resume session: load KV from SSD to memory."""
     mgr = _mgr()
     manifest = mgr.get_session(session_id)
     if manifest is None:
@@ -378,13 +338,11 @@ async def resume_session(session_id: str):
     )
     if not success:
         raise HTTPException(500, "Resume failed")
-
     return {"session_id": session_id, "state": "active"}
 
 
 @router.delete("/{session_id}")
 async def delete_session(session_id: str):
-    """Delete a session and free all resources."""
     mgr = _mgr()
     if not mgr.delete_session(session_id):
         raise HTTPException(404, f"Session {session_id} not found")

@@ -400,6 +400,8 @@ class SessionManager:
         if manifest is None or manifest.state != SessionState.ACTIVE:
             return False
 
+        # Grab model_cache_config before remove clears it
+        _, mcc = self._kv_store.get(session_id)
         extracted = self._kv_store.remove(session_id)
         if extracted is None:
             logger.warning(f"Park {session_id}: no KV in memory (already parked or first turn)")
@@ -415,6 +417,7 @@ class SessionManager:
                 park_id,
                 manifest.token_ids,
                 extracted,
+                model_cache_config=mcc,
             )
             if block_table is not None:
                 manifest.parked_block_table_id = park_id
