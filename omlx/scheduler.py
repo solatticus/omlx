@@ -2657,52 +2657,76 @@ class Scheduler:
         Reconstruct inference-ready cache objects from in-memory extracted state.
 
         This is the fast path for session cache injection -- no SSD I/O.
-        The extracted_cache format matches _extract_cache_states() output.
+        Uses the same CacheTypeHandler.reconstruct_cache() methods that the
+        paged SSD prefix cache uses, but skips the SSD load step since
+        tensors are already in memory.
+
+        The extracted_cache format matches _extract_cache_states() output:
+        list of dicts with {state, meta_state, class_name, cache_type}.
 
         Returns list of cache objects ready for BatchGenerator.insert(caches=...).
         """
         if not extracted_cache:
             return None
 
+        if not HAS_CACHE_TYPE_HANDLERS or CacheTypeRegistry is None:
+            logger.error("Session cache reconstruction requires CacheTypeRegistry")
+            return None
+
         try:
-            prompt_cache = _make_cache(self.model, 0, None)
-            if prompt_cache is None or len(prompt_cache) != len(extracted_cache):
-                logger.debug(
-                    f"Session cache layer count mismatch: model has "
-                    f"{len(prompt_cache) if prompt_cache else 0} layers, "
-                    f"extracted has {len(extracted_cache)}"
-                )
-                return None
+            reconstructed = []
+            for layer_idx, layer_data in enumerate(extracted_cache):
+                state = layer_data.get("state", ())
+                meta = layer_data.get("meta_state", ())
+                class_name = layer_data.get("class_name", "KVCache")
 
-            for layer_idx, (cache_obj, extracted) in enumerate(
-                zip(prompt_cache, extracted_cache)
-            ):
-                state = extracted.get("state", ())
-                meta = extracted.get("meta_state", ())
-                class_name = extracted.get("class_name", "KVCache")
+                handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+                if handler is None:
+                    logger.error(
+                        f"Session cache layer {layer_idx}: no handler "
+                        f"for {class_name}"
+                    )
+                    return None
 
-                # Use CacheTypeRegistry handlers if available
-                if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
-                    try:
-                        handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
-                        if handler and hasattr(handler, "restore_state"):
-                            handler.restore_state(cache_obj, state, meta)
-                            continue
-                    except Exception as e:
-                        logger.debug(
-                            f"Session cache layer {layer_idx}: "
-                            f"handler restore failed: {e}"
-                        )
+                # Convert extracted state format to handler state format.
+                # _extract_cache_states stores: state=(keys, values) for KVCache
+                # handler.reconstruct_cache expects: {keys: ..., values: ...}
+                if class_name == "CacheList":
+                    # CacheList: state is list of sub-states
+                    handler_state = {"sub_states": state}
+                elif class_name in ("ArraysCache", "SizedArraysCache", "MambaCache"):
+                    # ArraysCache: state is (conv_state, ssm_state)
+                    if isinstance(state, (list, tuple)) and len(state) >= 2:
+                        handler_state = {"states": list(state)}
+                    else:
+                        handler_state = {"states": state}
+                else:
+                    # KVCache / RotatingKVCache: state is (keys, values)
+                    if isinstance(state, (list, tuple)) and len(state) >= 2:
+                        handler_state = {"keys": state[0], "values": state[1]}
+                    else:
+                        handler_state = {"keys": state, "values": state}
 
-                # Fallback: direct state/meta assignment
-                if hasattr(cache_obj, "state") and state:
-                    cache_obj.state = state
-                if hasattr(cache_obj, "meta_state") and meta:
-                    cache_obj.meta_state = meta
+                cache_obj = handler.reconstruct_cache(handler_state, meta)
+                if cache_obj is None:
+                    logger.error(
+                        f"Session cache layer {layer_idx}: "
+                        f"handler.reconstruct_cache returned None "
+                        f"for {class_name}"
+                    )
+                    return None
 
-            return prompt_cache
+                reconstructed.append(cache_obj)
+
+            logger.debug(
+                f"Session cache reconstructed: {len(reconstructed)} layers"
+            )
+            return reconstructed
+
         except Exception as e:
             logger.error(f"Session cache reconstruction failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None
 
     def set_specprefill_draft_model(
