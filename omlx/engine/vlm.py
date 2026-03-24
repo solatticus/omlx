@@ -651,12 +651,16 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
         )
 
+        # Session support: forward session_id to engine
+        session_id = kwargs.pop("session_id", None)
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            session_id=session_id,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -722,12 +726,16 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
+        # Session support: forward session_id to engine
+        session_id = kwargs.pop("session_id", None)
+
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            session_id=session_id,
             **specprefill_kwargs,
         )
 

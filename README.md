@@ -39,6 +39,51 @@
 
 ---
 
+> ## TL;DR: Stateful Sessions for Local LLMs
+>
+> **Every cloud LLM provider is stateless because they have to be.** They serve
+> 200 million users — they can't hold your KV cache between turns. So every
+> request re-sends the entire conversation, and the server recomputes everything
+> from scratch. You pay for it in latency, they pay for it in compute. Nobody
+> wins, but at scale there's no alternative.
+>
+> **You're not at scale.** You're one household. One small team. One mesh of
+> machines in a closet. The constraint doesn't apply to you.
+>
+> This fork adds **persistent sessions** to oMLX. After a chat completion, the
+> KV cache stays in memory, tagged with a session ID. Next turn, only the new
+> tokens are computed — everything prior is already there. The server *remembers*.
+>
+> **What this means in practice:**
+> - Turn 1: 0% cache hit (cold start, full prefill)
+> - Turn 2: 44% cache hit (prior turn's context reused)
+> - Turn 3: 45% cache hit (compounding)
+> - Turn 4: 75% cache hit (3/4 of the prompt is free)
+> - Turn 20: nearly everything is cached. Prefill becomes negligible.
+>
+> **Park** a session to SSD when you're done — resume it hours later in seconds.
+> The KV state serializes to a safetensors file, loads back when you need it.
+> Walk away from your desk, come back, pick up exactly where you left off.
+>
+> **The endpoints:**
+> ```
+> POST   /v1/sessions              — create a session
+> POST   /v1/sessions/{id}/chat    — chat (KV retained between turns)
+> GET    /v1/sessions              — list sessions
+> POST   /v1/sessions/{id}/park    — serialize KV to SSD, free memory
+> POST   /v1/sessions/{id}/resume  — load KV from SSD
+> DELETE /v1/sessions/{id}         — destroy session
+> ```
+>
+> The existing `/v1/chat/completions` endpoint is unchanged. Sessions are
+> additive — use them when you want persistent state, ignore them when you don't.
+>
+> **This is the way local inference should work.** Cloud providers can't do this.
+> You can, because it's your hardware, your model, your memory. One user, one
+> machine, zero reason to forget.
+>
+> *Built for households, small businesses, and anyone running their own models.*
+
 <p align="center">
   <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
 </p>

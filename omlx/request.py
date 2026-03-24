@@ -154,6 +154,9 @@ class Request:
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter
 
+    # Session support (KV cache retained across turns)
+    session_id: Optional[str] = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
