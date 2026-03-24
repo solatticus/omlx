@@ -6,14 +6,15 @@ Sessions hold KV cache state in memory between chat turns, enabling
 append-only inference: only new tokens are computed each turn instead
 of reprocessing the full conversation history.
 
-Park/resume serializes session KV to SSD and back, reusing the existing
-paged SSD cache infrastructure.
+Park/resume serializes session KV directly to SSD as safetensors files,
+bypassing the paged block cache (which requires full-block alignment).
 """
 
 import enum
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -24,6 +25,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for meta_state JSON serialization
+# ---------------------------------------------------------------------------
+
+def _meta_to_json(meta):
+    """Convert meta_state tuple to JSON-safe structure."""
+    if isinstance(meta, (list, tuple)):
+        return [_meta_to_json(x) for x in meta]
+    if isinstance(meta, (int, float, str, bool, type(None))):
+        return meta
+    return str(meta)
+
+
+def _json_to_meta(data):
+    """Convert JSON structure back to meta_state tuple."""
+    if isinstance(data, list):
+        return tuple(_json_to_meta(x) for x in data)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +77,7 @@ class SessionManifest:
     token_ids: List[int] = field(default_factory=list)
     messages: List[Dict[str, Any]] = field(default_factory=list)
     state: SessionState = SessionState.ACTIVE
-    # request_id alias used when KV is parked to SSD via block_aware_cache
+    # Legacy field — kept for manifest compat, no longer used by direct SSD path
     parked_block_table_id: Optional[str] = None
     # TTL in seconds — default 6 hours
     ttl: float = 6 * 3600
@@ -272,6 +293,11 @@ class SessionManager:
 
         self._kv_store.remove(session_id)
         self._remove_manifest_file(session_id)
+        # Clean up KV directory on SSD
+        if self._state_dir:
+            kv_dir = self._state_dir / f"{session_id}.kv"
+            if kv_dir.exists():
+                shutil.rmtree(kv_dir, ignore_errors=True)
         with self._global_lock:
             self._locks.pop(session_id, None)
         logger.info(f"Session deleted: {session_id}")
@@ -381,127 +407,275 @@ class SessionManager:
         )
 
     # ------------------------------------------------------------------
-    # Park / Resume
+    # Park / Resume — direct safetensors serialization
     # ------------------------------------------------------------------
 
-    def park_session(
-        self,
-        session_id: str,
-        store_cache_fn: Any,
-    ) -> bool:
+    def _flatten_extracted_to_tensors(
+        self, extracted: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, Any], List[Dict]]:
         """
-        Park session: move KV from memory to SSD.
+        Flatten extracted cache into a flat {key: mx.array} dict for safetensors,
+        plus a metadata list describing the structure for reconstruction.
+        """
+        tensors = {}
+        layer_meta = []
 
-        Args:
-            store_cache_fn: Callable matching BlockAwarePrefixCache.store_cache()
-                signature: (request_id, token_ids, extracted_cache, ...) -> block_table
+        for i, layer in enumerate(extracted):
+            class_name = layer.get("class_name", "KVCache")
+            cache_type = layer.get("cache_type", class_name)
+            meta_state = layer.get("meta_state", ())
+            state = layer.get("state", ())
+
+            lm: Dict[str, Any] = {
+                "class_name": class_name,
+                "cache_type": cache_type,
+                "meta_state": _meta_to_json(meta_state),
+                "tensor_keys": [],
+            }
+
+            if class_name == "CacheList":
+                # state is list of sub-states
+                # meta_state is (sub_class_names, sub_meta_states)
+                sub_class_names = (
+                    meta_state[0] if meta_state and len(meta_state) > 0 else []
+                )
+                sub_meta_states = (
+                    meta_state[1] if meta_state and len(meta_state) > 1 else []
+                )
+                sub_meta_list = []
+                for j, sub_state in enumerate(state):
+                    sub_cn = (
+                        sub_class_names[j]
+                        if j < len(sub_class_names)
+                        else "KVCache"
+                    )
+                    sub_ms = (
+                        sub_meta_states[j]
+                        if j < len(sub_meta_states)
+                        else ()
+                    )
+                    sub_keys = []
+                    if isinstance(sub_state, (list, tuple)):
+                        for k, tensor in enumerate(sub_state):
+                            if hasattr(tensor, "nbytes"):
+                                key = f"l{i}.c{j}.t{k}"
+                                tensors[key] = tensor
+                                sub_keys.append(key)
+                    sub_meta_list.append({
+                        "class_name": sub_cn,
+                        "meta_state": _meta_to_json(sub_ms),
+                        "tensor_keys": sub_keys,
+                    })
+                lm["sub_caches"] = sub_meta_list
+
+            elif isinstance(state, (list, tuple)):
+                for k, tensor in enumerate(state):
+                    if hasattr(tensor, "nbytes"):
+                        key = f"l{i}.t{k}"
+                        tensors[key] = tensor
+                        lm["tensor_keys"].append(key)
+
+            layer_meta.append(lm)
+
+        return tensors, layer_meta
+
+    def _unflatten_tensors_to_extracted(
+        self, tensors: Dict[str, Any], layer_meta: List[Dict]
+    ) -> List[Dict[str, Any]]:
+        """
+        Reverse of _flatten_extracted_to_tensors.
+        Rebuilds the extracted cache format from flat tensors + metadata.
+        """
+        extracted = []
+
+        for lm in layer_meta:
+            class_name = lm["class_name"]
+            cache_type = lm.get("cache_type", class_name)
+            meta_state = _json_to_meta(lm["meta_state"])
+
+            if class_name == "CacheList":
+                sub_states = []
+                sub_class_names = []
+                sub_meta_states = []
+                for sub in lm.get("sub_caches", []):
+                    sub_tensors = tuple(
+                        tensors[k] for k in sub["tensor_keys"]
+                    )
+                    sub_states.append(sub_tensors)
+                    sub_class_names.append(sub["class_name"])
+                    sub_meta_states.append(_json_to_meta(sub["meta_state"]))
+
+                extracted.append({
+                    "state": sub_states,
+                    "meta_state": (sub_class_names, sub_meta_states),
+                    "class_name": "CacheList",
+                    "cache_type": "CacheList",
+                })
+            else:
+                state = tuple(tensors[k] for k in lm["tensor_keys"])
+                extracted.append({
+                    "state": state,
+                    "meta_state": meta_state,
+                    "class_name": class_name,
+                    "cache_type": cache_type,
+                })
+
+        return extracted
+
+    def park_session(self, session_id: str, **kwargs) -> bool:
+        """
+        Park session: serialize KV tensors directly to SSD via safetensors.
+        Bypasses the paged block cache entirely — no block-size alignment needed.
         """
         manifest = self._manifests.get(session_id)
         if manifest is None or manifest.state != SessionState.ACTIVE:
             return False
 
-        # Grab model_cache_config before remove clears it
         _, mcc = self._kv_store.get(session_id)
         extracted = self._kv_store.remove(session_id)
         if extracted is None:
-            logger.warning(f"Park {session_id}: no KV in memory (already parked or first turn)")
+            logger.warning(
+                f"Park {session_id}: no KV in memory (already parked or first turn)"
+            )
             manifest.state = SessionState.PARKED
             self._persist_manifest(manifest)
             return True
 
         manifest.state = SessionState.PARKING
-        park_id = f"session-{session_id}"
 
-        try:
-            block_table = store_cache_fn(
-                park_id,
-                manifest.token_ids,
-                extracted,
-                model_cache_config=mcc,
-            )
-            if block_table is not None:
-                manifest.parked_block_table_id = park_id
-                manifest.state = SessionState.PARKED
-                self._persist_manifest(manifest)
-                logger.info(
-                    f"Session {session_id} parked "
-                    f"({manifest.total_tokens} tokens -> SSD)"
-                )
-                return True
-            else:
-                logger.error(f"Park {session_id}: store_cache returned None")
-                # Put KV back
-                self._kv_store.put(session_id, extracted)
-                manifest.state = SessionState.ACTIVE
-                return False
-        except Exception as e:
-            logger.error(f"Park {session_id} failed: {e}")
-            # Put KV back
-            self._kv_store.put(session_id, extracted)
+        if self._state_dir is None:
+            logger.error(f"Park {session_id}: no state_dir configured")
+            self._kv_store.put(session_id, extracted, mcc)
             manifest.state = SessionState.ACTIVE
             return False
 
-    def resume_session(
-        self,
-        session_id: str,
-        fetch_cache_fn: Any,
-        reconstruct_cache_fn: Any,
-        extract_cache_states_fn: Any,
-    ) -> bool:
-        """
-        Resume session: load KV from SSD back to memory.
+        kv_dir = self._state_dir / f"{session_id}.kv"
 
-        Args:
-            fetch_cache_fn: BlockAwarePrefixCache.fetch_cache(request_id, token_ids)
-            reconstruct_cache_fn: BlockAwarePrefixCache.reconstruct_cache(block_table)
-            extract_cache_states_fn: Scheduler._extract_cache_states(raw_cache)
+        try:
+            import mlx.core as mx
+
+            kv_dir.mkdir(parents=True, exist_ok=True)
+
+            # Flatten to tensors + metadata
+            tensors, layer_meta = self._flatten_extracted_to_tensors(extracted)
+
+            if tensors:
+                mx.save_safetensors(
+                    str(kv_dir / "tensors.safetensors"), tensors
+                )
+
+            # Save structure metadata
+            meta = {
+                "num_layers": len(layer_meta),
+                "layers": layer_meta,
+                "total_tokens": manifest.total_tokens,
+                "model_name": manifest.model_name,
+            }
+            # Atomic write for meta.json
+            fd, tmp = tempfile.mkstemp(
+                dir=str(kv_dir), suffix=".tmp", prefix=".meta-"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(meta, f, indent=2)
+                os.rename(tmp, str(kv_dir / "meta.json"))
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+            manifest.state = SessionState.PARKED
+            self._persist_manifest(manifest)
+
+            tensor_bytes = sum(
+                t.nbytes for t in tensors.values() if hasattr(t, "nbytes")
+            )
+            logger.info(
+                f"Session {session_id} parked "
+                f"({manifest.total_tokens} tokens, "
+                f"{tensor_bytes / (1024*1024):.1f}MB -> {kv_dir})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Park {session_id} failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Put KV back in memory
+            self._kv_store.put(session_id, extracted, mcc)
+            manifest.state = SessionState.ACTIVE
+            return False
+
+    def resume_session(self, session_id: str, **kwargs) -> bool:
+        """
+        Resume session: load KV tensors from SSD safetensors.
+        Bypasses the paged block cache entirely.
         """
         manifest = self._manifests.get(session_id)
         if manifest is None or manifest.state != SessionState.PARKED:
             return False
 
-        park_id = manifest.parked_block_table_id
-        if park_id is None:
-            logger.error(f"Resume {session_id}: no parked_block_table_id")
+        if self._state_dir is None:
+            logger.error(f"Resume {session_id}: no state_dir configured")
+            return False
+
+        kv_dir = self._state_dir / f"{session_id}.kv"
+        meta_path = kv_dir / "meta.json"
+
+        if not meta_path.exists():
+            logger.error(
+                f"Resume {session_id}: no KV data at {kv_dir} "
+                f"(session may have been parked without KV)"
+            )
             return False
 
         manifest.state = SessionState.RESUMING
 
         try:
-            block_table, remaining = fetch_cache_fn(park_id, manifest.token_ids)
-            if block_table is None or block_table.num_tokens == 0:
-                logger.error(f"Resume {session_id}: fetch_cache returned no blocks")
-                manifest.state = SessionState.PARKED
-                return False
+            import mlx.core as mx
 
-            reconstructed = reconstruct_cache_fn(block_table)
-            if reconstructed is None:
-                logger.error(f"Resume {session_id}: reconstruct_cache failed")
-                manifest.state = SessionState.PARKED
-                return False
+            # Load structure metadata
+            with open(meta_path) as f:
+                meta = json.load(f)
 
-            # Extract states back into session format
-            extracted, mcc = extract_cache_states_fn(reconstructed)
+            # Load tensors
+            tensors_path = kv_dir / "tensors.safetensors"
+            if tensors_path.exists():
+                tensors = mx.load(str(tensors_path))
+            else:
+                tensors = {}
+
+            # Reconstruct extracted cache format
+            extracted = self._unflatten_tensors_to_extracted(
+                tensors, meta["layers"]
+            )
+
             if not extracted:
-                logger.error(f"Resume {session_id}: extract_cache_states returned empty")
+                logger.error(f"Resume {session_id}: reconstructed empty cache")
                 manifest.state = SessionState.PARKED
                 return False
 
-            self._kv_store.put(session_id, extracted, mcc)
+            self._kv_store.put(session_id, extracted)
             manifest.state = SessionState.ACTIVE
-            manifest.parked_block_table_id = None
             manifest.last_active = time.time()
             self._persist_manifest(manifest)
 
+            tensor_bytes = sum(
+                t.nbytes for t in tensors.values() if hasattr(t, "nbytes")
+            )
             logger.info(
                 f"Session {session_id} resumed "
                 f"({manifest.total_tokens} tokens, "
-                f"~{self._kv_store.session_size(session_id) / (1024*1024):.1f}MB)"
+                f"{tensor_bytes / (1024*1024):.1f}MB from {kv_dir})"
             )
             return True
 
         except Exception as e:
             logger.error(f"Resume {session_id} failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             manifest.state = SessionState.PARKED
             return False
 
@@ -531,28 +705,32 @@ class SessionManager:
         if manifest is None or manifest.state != SessionState.ACTIVE:
             return None
 
-        if store_cache_fn is not None:
-            success = self.park_session(lru_id, store_cache_fn)
-            if success:
-                return lru_id
-            # If park fails, just evict the KV without SSD backup
-            logger.warning(f"LRU eviction: park failed for {lru_id}, dropping KV")
+        # Try direct SSD park first
+        success = self.park_session(lru_id)
+        if success:
+            return lru_id
 
-        # Evict without parking (KV lost, but session manifest survives)
+        # If park fails, just evict the KV without SSD backup
+        logger.warning(f"LRU eviction: park failed for {lru_id}, dropping KV")
         self._kv_store.remove(lru_id)
         manifest.state = SessionState.PARKED
         self._persist_manifest(manifest)
         logger.info(f"LRU eviction: dropped KV for session {lru_id}")
         return lru_id
 
-    def park_all_for_model(self, model_name: str, store_cache_fn: Any = None) -> int:
+    def park_all_for_model(
+        self, model_name: str, store_cache_fn: Any = None
+    ) -> int:
         """Park all active sessions for a model. Returns count parked."""
         count = 0
         for manifest in list(self._manifests.values()):
-            if manifest.model_name == model_name and manifest.state == SessionState.ACTIVE:
-                if store_cache_fn:
-                    self.park_session(manifest.session_id, store_cache_fn)
-                else:
+            if (
+                manifest.model_name == model_name
+                and manifest.state == SessionState.ACTIVE
+            ):
+                success = self.park_session(manifest.session_id)
+                if not success:
+                    # Fallback: just evict KV
                     self._kv_store.remove(manifest.session_id)
                     manifest.state = SessionState.PARKED
                     self._persist_manifest(manifest)
@@ -638,6 +816,10 @@ class SessionManager:
                 # Skip expired sessions
                 if manifest.is_expired:
                     path.unlink(missing_ok=True)
+                    # Also clean up KV directory
+                    kv_dir = self._state_dir / f"{manifest.session_id}.kv"
+                    if kv_dir.exists():
+                        shutil.rmtree(kv_dir, ignore_errors=True)
                     continue
                 self._manifests[manifest.session_id] = manifest
                 count += 1

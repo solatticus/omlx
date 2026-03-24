@@ -304,13 +304,7 @@ async def park_session(session_id: str):
     if manifest.state.value != "active":
         raise HTTPException(409, f"Session is {manifest.state.value}, cannot park")
 
-    engine = await _get_engine_for_model(manifest.model_name)
-    scheduler = engine._engine.engine.scheduler
-    if scheduler.block_aware_cache is None:
-        raise HTTPException(500, "No cache backend configured")
-
-    store_fn = scheduler.block_aware_cache.store_cache
-    success = mgr.park_session(session_id, store_fn)
+    success = mgr.park_session(session_id)
     if not success:
         raise HTTPException(500, "Park failed")
     return {"session_id": session_id, "state": "parked"}
@@ -325,17 +319,7 @@ async def resume_session(session_id: str):
     if manifest.state.value != "parked":
         raise HTTPException(409, f"Session is {manifest.state.value}, cannot resume")
 
-    engine = await _get_engine_for_model(manifest.model_name)
-    scheduler = engine._engine.engine.scheduler
-    if scheduler.block_aware_cache is None:
-        raise HTTPException(500, "No cache backend configured")
-
-    success = mgr.resume_session(
-        session_id,
-        fetch_cache_fn=scheduler.block_aware_cache.fetch_cache,
-        reconstruct_cache_fn=scheduler.block_aware_cache.reconstruct_cache,
-        extract_cache_states_fn=scheduler._extract_cache_states,
-    )
+    success = mgr.resume_session(session_id)
     if not success:
         raise HTTPException(500, "Resume failed")
     return {"session_id": session_id, "state": "active"}
