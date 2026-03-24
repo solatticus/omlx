@@ -2507,7 +2507,11 @@ class Scheduler:
                 )
             )
             if extracted is not None:
-                reconstructed = self._reconstruct_from_extracted(extracted, mcc)
+                # trim_to_length handles generation prompt tokens that
+                # were in the stored cache but don't appear in the next turn
+                reconstructed = self._reconstruct_from_extracted(
+                    extracted, mcc, trim_to_length=cached_tokens
+                )
                 if reconstructed is not None:
                     request.prompt_cache = reconstructed
                     request.cached_tokens = cached_tokens
@@ -2652,6 +2656,7 @@ class Scheduler:
         self,
         extracted_cache: "List[Dict[str, Any]]",
         model_cache_config: "Any" = None,
+        trim_to_length: "Optional[int]" = None,
     ) -> "Optional[List[Any]]":
         """
         Reconstruct inference-ready cache objects from in-memory extracted state.
@@ -2706,6 +2711,17 @@ class Scheduler:
                         handler_state = {"keys": state[0], "values": state[1]}
                     else:
                         handler_state = {"keys": state, "values": state}
+
+                # Trim KV tensors if session prefix is shorter than full cache
+                if trim_to_length is not None and class_name in ("KVCache",):
+                    keys = handler_state.get("keys")
+                    values = handler_state.get("values")
+                    if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
+                        if keys.shape[2] > trim_to_length:
+                            handler_state["keys"] = keys[:, :, :trim_to_length, :]
+                            handler_state["values"] = values[:, :, :trim_to_length, :]
+                    # Override offset in meta_state
+                    meta = (trim_to_length,) + (meta[1:] if meta and len(meta) > 1 else ())
 
                 cache_obj = handler.reconstruct_cache(handler_state, meta)
                 if cache_obj is None:

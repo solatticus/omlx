@@ -316,19 +316,28 @@ class SessionManager:
             )
             return None, None, 0, new_token_ids
 
-        if new_token_ids[:cached_len] != manifest.token_ids:
+        # Find longest common prefix (generation prompt tokens at the end
+        # of the stored sequence may not appear in the next turn's template)
+        match_len = self._find_divergence(manifest.token_ids, new_token_ids)
+
+        if match_len == 0:
             logger.warning(
-                f"Session {session_id}: token prefix mismatch at offset "
-                f"{self._find_divergence(manifest.token_ids, new_token_ids)} — "
+                f"Session {session_id}: no token prefix match at all — "
                 f"falling back to prefix cache"
             )
-            # Invalidate stale session KV
             self._kv_store.remove(session_id)
             manifest.token_ids = []
             return None, None, 0, new_token_ids
 
-        remaining = new_token_ids[cached_len:]
-        return extracted, model_cache_config, cached_len, remaining
+        if match_len < cached_len:
+            logger.debug(
+                f"Session {session_id}: partial prefix match "
+                f"{match_len}/{cached_len} tokens "
+                f"(generation prompt trimmed)"
+            )
+
+        remaining = new_token_ids[match_len:]
+        return extracted, model_cache_config, match_len, remaining
 
     def update_after_generation(
         self,
