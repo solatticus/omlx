@@ -90,6 +90,7 @@ class EnginePool:
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._session_manager: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
 
@@ -584,6 +585,14 @@ class EnginePool:
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()
+
+            # Propagate session manager to new engine's scheduler
+            if self._session_manager is not None:
+                try:
+                    scheduler = engine._engine.engine.scheduler
+                    scheduler.set_session_manager(self._session_manager)
+                except Exception as e:
+                    logger.debug(f"Failed to set session manager on scheduler: {e}")
 
             logger.info(
                 f"Loaded model: {model_id} "

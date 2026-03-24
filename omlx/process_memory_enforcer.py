@@ -243,6 +243,17 @@ class ProcessMemoryEnforcer:
         # no GIL issue), so they will abort independently of this enforcer.
         async with self._engine_pool._lock:
             while mx.get_active_memory() > self._max_bytes:
+                # Try auto-parking LRU sessions before evicting models
+                session_mgr = getattr(self._engine_pool, '_session_manager', None)
+                if session_mgr is not None and session_mgr.get_active_memory() > 0:
+                    parked_id = session_mgr.evict_lru_session()
+                    if parked_id is not None:
+                        logger.info(
+                            f"Auto-parked session {parked_id} to free memory "
+                            f"({_format_gb(mx.get_active_memory())} active)"
+                        )
+                        continue  # Re-check after parking
+
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
                     # Count loaded non-pinned models

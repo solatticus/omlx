@@ -256,6 +256,7 @@ class EngineCore:
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
         specprefill_system_end: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -290,6 +291,7 @@ class EngineCore:
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            session_id=session_id,
         )
 
         # SpecPrefill: resolve per-request settings.

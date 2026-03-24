@@ -1069,6 +1069,9 @@ class Scheduler:
         self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
         self.memory_monitor: Optional["MemoryMonitor"] = None
 
+        # Session manager for stateful KV cache retention across turns
+        self._session_manager: Optional[Any] = None
+
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
             # Calculate max_blocks automatically if not specified
@@ -2492,8 +2495,46 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        # Session cache injection: if request belongs to a session with
+        # in-memory KV, reconstruct and inject it, skipping SSD prefix cache.
+        if (
+            request.session_id
+            and self._session_manager is not None
+        ):
+            extracted, mcc, cached_tokens, remaining = (
+                self._session_manager.prepare_request_cache(
+                    request.session_id, request.prompt_token_ids
+                )
+            )
+            if extracted is not None:
+                reconstructed = self._reconstruct_from_extracted(extracted, mcc)
+                if reconstructed is not None:
+                    request.prompt_cache = reconstructed
+                    request.cached_tokens = cached_tokens
+                    request.remaining_tokens = remaining
+                    # Handle exact match: back off by 1 token for generation kickoff
+                    if len(remaining) == 0 and cached_tokens > 0:
+                        if self._trim_prompt_cache_for_generation(request.prompt_cache):
+                            request.cached_tokens = max(0, request.cached_tokens - 1)
+                            request.remaining_tokens = request.prompt_token_ids[-1:]
+                        else:
+                            request.prompt_cache = None
+                            request.cached_tokens = 0
+                            request.remaining_tokens = request.prompt_token_ids
+                    logger.debug(
+                        f"Request {request.request_id}: session {request.session_id} "
+                        f"cache injected, {request.cached_tokens} cached tokens, "
+                        f"{len(request.remaining_tokens)} remaining"
+                    )
+                else:
+                    request.remaining_tokens = request.prompt_token_ids
+                    logger.debug(
+                        f"Request {request.request_id}: session cache reconstruction "
+                        f"failed, falling back to prefix cache"
+                    )
+
         # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        elif self.block_aware_cache is not None:
             # Use paged cache
             # Build extra_keys for VLM image hash prefix cache isolation
             extra_keys = None
@@ -2602,6 +2643,67 @@ class Scheduler:
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def set_session_manager(self, manager: "Any") -> None:
+        """Set the session manager for stateful KV cache retention."""
+        self._session_manager = manager
+
+    def _reconstruct_from_extracted(
+        self,
+        extracted_cache: "List[Dict[str, Any]]",
+        model_cache_config: "Any" = None,
+    ) -> "Optional[List[Any]]":
+        """
+        Reconstruct inference-ready cache objects from in-memory extracted state.
+
+        This is the fast path for session cache injection -- no SSD I/O.
+        The extracted_cache format matches _extract_cache_states() output.
+
+        Returns list of cache objects ready for BatchGenerator.insert(caches=...).
+        """
+        if not extracted_cache:
+            return None
+
+        try:
+            prompt_cache = _make_cache(self.model, 0, None)
+            if prompt_cache is None or len(prompt_cache) != len(extracted_cache):
+                logger.debug(
+                    f"Session cache layer count mismatch: model has "
+                    f"{len(prompt_cache) if prompt_cache else 0} layers, "
+                    f"extracted has {len(extracted_cache)}"
+                )
+                return None
+
+            for layer_idx, (cache_obj, extracted) in enumerate(
+                zip(prompt_cache, extracted_cache)
+            ):
+                state = extracted.get("state", ())
+                meta = extracted.get("meta_state", ())
+                class_name = extracted.get("class_name", "KVCache")
+
+                # Use CacheTypeRegistry handlers if available
+                if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+                    try:
+                        handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+                        if handler and hasattr(handler, "restore_state"):
+                            handler.restore_state(cache_obj, state, meta)
+                            continue
+                    except Exception as e:
+                        logger.debug(
+                            f"Session cache layer {layer_idx}: "
+                            f"handler restore failed: {e}"
+                        )
+
+                # Fallback: direct state/meta assignment
+                if hasattr(cache_obj, "state") and state:
+                    cache_obj.state = state
+                if hasattr(cache_obj, "meta_state") and meta:
+                    cache_obj.meta_state = meta
+
+            return prompt_cache
+        except Exception as e:
+            logger.error(f"Session cache reconstruction failed: {e}")
+            return None
 
     def set_specprefill_draft_model(
         self, draft_model: Any, draft_model_name: Optional[str] = None
@@ -3601,6 +3703,41 @@ class Scheduler:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     block_table = None
+                    # Session KV retention: if request belongs to a session,
+                    # send extracted cache to SessionManager instead of SSD.
+                    if (
+                        request.session_id
+                        and self._session_manager is not None
+                        and hasattr(request, '_extracted_cache')
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            model_cache_config = getattr(
+                                request, '_model_cache_config', None
+                            )
+                            self._session_manager.update_after_generation(
+                                session_id=request.session_id,
+                                prompt_token_ids=list(request.prompt_token_ids),
+                                output_token_ids=list(request.output_token_ids),
+                                extracted_cache=request._extracted_cache,
+                                model_cache_config=model_cache_config,
+                                prompt_tokens=request.num_prompt_tokens,
+                                completion_tokens=request.num_output_tokens,
+                            )
+                            # Null out so the existing SSD storage block is skipped
+                            request._extracted_cache = None
+                            logger.debug(
+                                f"Session {request.session_id}: retained KV cache "
+                                f"({len(request.prompt_token_ids) + len(request.output_token_ids)} tokens)"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Session KV retention failed for "
+                                f"{request.session_id}: {e}"
+                            )
+                            # Fall through — _extracted_cache still set,
+                            # normal SSD storage proceeds as backup
+
                     if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)

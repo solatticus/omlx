@@ -219,6 +219,7 @@ class ServerState:
     ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
+    session_manager: Optional[object] = None  # SessionManager
 
 
 # Global server state instance
@@ -308,6 +309,10 @@ async def lifespan(app: FastAPI):
             _server_state.engine_pool._process_memory_enforcer = enforcer
             enforcer.start()
 
+    # Propagate session manager to engine pool
+    if _server_state.session_manager is not None and _server_state.engine_pool is not None:
+        _server_state.engine_pool._session_manager = _server_state.session_manager
+
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
     ttl_task = None
@@ -375,6 +380,16 @@ app = FastAPI(
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
+
+# Include session routes
+from .api.session_routes import router as session_router, set_session_getters
+set_session_getters(
+    lambda: _server_state.session_manager,
+    get_engine_pool,
+    get_engine_for_model,
+    get_server_state,
+)
+app.include_router(session_router)
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -1002,6 +1017,16 @@ def init_server(
             / "response-state"
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
+
+    # Initialize session manager
+    from .session import SessionManager
+    session_state_dir = None
+    if global_settings:
+        session_state_dir = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "sessions"
+        )
+    _server_state.session_manager = SessionManager(state_dir=session_state_dir)
 
     # Refresh i18n with loaded language setting
     from .admin.routes import _refresh_i18n_globals
