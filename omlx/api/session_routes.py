@@ -223,9 +223,8 @@ async def _do_session_chat(mgr, manifest, request, http_request):
     # Get engine for the session's model
     engine = await _get_engine_for_model(manifest.model_name)
 
-    # Extract messages
-    from .utils import extract_text_content
-    messages = extract_text_content(request.messages)
+    # Messages are already list[dict] from the request
+    messages = request.messages
 
     # Apply chat template to get prompt
     chat_template_kwargs = {}

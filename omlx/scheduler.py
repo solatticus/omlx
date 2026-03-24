@@ -3715,10 +3715,19 @@ class Scheduler:
                             model_cache_config = getattr(
                                 request, '_model_cache_config', None
                             )
+                            # For thinking models, only cache prompt tokens
+                            # (output contains <think> tags that the API strips
+                            # before the next turn, so they never match)
+                            if getattr(request, 'needs_think_prefix', False):
+                                session_token_ids = list(request.prompt_token_ids)
+                                session_output_ids = []
+                            else:
+                                session_token_ids = list(request.prompt_token_ids)
+                                session_output_ids = list(request.output_token_ids)
                             self._session_manager.update_after_generation(
                                 session_id=request.session_id,
-                                prompt_token_ids=list(request.prompt_token_ids),
-                                output_token_ids=list(request.output_token_ids),
+                                prompt_token_ids=session_token_ids,
+                                output_token_ids=session_output_ids,
                                 extracted_cache=request._extracted_cache,
                                 model_cache_config=model_cache_config,
                                 prompt_tokens=request.num_prompt_tokens,

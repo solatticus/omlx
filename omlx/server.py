@@ -381,16 +381,6 @@ from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
 
-# Include session routes
-from .api.session_routes import router as session_router, set_session_getters
-set_session_getters(
-    lambda: _server_state.session_manager,
-    get_engine_pool,
-    get_engine_for_model,
-    get_server_state,
-)
-app.include_router(session_router)
-
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
 from .admin.auth import _RedirectToLogin
@@ -401,6 +391,10 @@ set_admin_getters(
     lambda: _server_state.global_settings,
 )
 app.include_router(admin_router)
+
+# Include session routes (getters configured in configure_server)
+from .api.session_routes import router as session_router, set_session_getters
+app.include_router(session_router)
 
 
 @app.exception_handler(_RedirectToLogin)
@@ -1027,6 +1021,15 @@ def init_server(
             / "sessions"
         )
     _server_state.session_manager = SessionManager(state_dir=session_state_dir)
+
+    # Set session route getters (deferred from module-level because
+    # get_engine_for_model is defined after router includes)
+    set_session_getters(
+        lambda: _server_state.session_manager,
+        get_engine_pool,
+        get_engine_for_model,
+        get_server_state,
+    )
 
     # Refresh i18n with loaded language setting
     from .admin.routes import _refresh_i18n_globals
