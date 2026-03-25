@@ -286,6 +286,11 @@ async def verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    # Propagate session manager to engine pool BEFORE preloading models
+    # (so engines loaded during preload get the session manager)
+    if _server_state.session_manager is not None and _server_state.engine_pool is not None:
+        _server_state.engine_pool._session_manager = _server_state.session_manager
+
     # Startup: Preload pinned models
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.preload_pinned_models()
@@ -308,10 +313,6 @@ async def lifespan(app: FastAPI):
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
             enforcer.start()
-
-    # Propagate session manager to engine pool
-    if _server_state.session_manager is not None and _server_state.engine_pool is not None:
-        _server_state.engine_pool._session_manager = _server_state.session_manager
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
