@@ -219,12 +219,29 @@ class SessionKVStore:
         total = 0
         for layer in extracted_cache:
             state = layer.get("state", ())
-            if isinstance(state, (list, tuple)):
+            # TurboQuant compressed: state is a dict with indices/norms
+            if isinstance(state, dict):
+                for v in state.values():
+                    if hasattr(v, "nbytes"):
+                        total += v.nbytes
+                    elif isinstance(v, dict):
+                        for vv in v.values():
+                            if hasattr(vv, "nbytes"):
+                                total += vv.nbytes
+            elif isinstance(state, (list, tuple)):
                 for item in state:
                     if hasattr(item, "nbytes"):
                         total += item.nbytes
+                    elif isinstance(item, dict):
+                        # Compressed sub-state
+                        for v in item.values():
+                            if hasattr(v, "nbytes"):
+                                total += v.nbytes
+                            elif isinstance(v, dict):
+                                for vv in v.values():
+                                    if hasattr(vv, "nbytes"):
+                                        total += vv.nbytes
                     elif isinstance(item, (list, tuple)):
-                        # CacheList sub-states
                         for sub in item:
                             if isinstance(sub, (list, tuple)):
                                 for t in sub:
