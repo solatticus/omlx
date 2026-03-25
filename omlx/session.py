@@ -119,12 +119,13 @@ class SessionKVStore:
     cache as a single unit for instant injection.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, compressor: Any = None) -> None:
         self._store: OrderedDict[str, List[Dict[str, Any]]] = OrderedDict()
         self._model_cache_configs: Dict[str, Any] = {}
         self._sizes: Dict[str, int] = {}
         self._total_bytes: int = 0
         self._lock = threading.Lock()
+        self._compressor = compressor  # TurboQuant instance or None
 
     def put(
         self,
@@ -133,6 +134,15 @@ class SessionKVStore:
         model_cache_config: Any = None,
     ) -> None:
         """Store extracted cache for a session. Replaces any existing entry."""
+        # Compress KV tensors if compressor is configured
+        if self._compressor is not None:
+            try:
+                from .cache.turboquant import compress_extracted_cache
+                extracted_cache = compress_extracted_cache(
+                    extracted_cache, self._compressor
+                )
+            except Exception as e:
+                logger.warning(f"KV compression failed, storing uncompressed: {e}")
         size = self._estimate_size(extracted_cache)
         with self._lock:
             # Remove old entry if updating
@@ -153,10 +163,19 @@ class SessionKVStore:
         with self._lock:
             if session_id in self._store:
                 self._store.move_to_end(session_id)  # update LRU
-                return (
-                    self._store[session_id],
-                    self._model_cache_configs.get(session_id),
-                )
+                extracted = self._store[session_id]
+                mcc = self._model_cache_configs.get(session_id)
+                # Decompress KV tensors if they were compressed
+                if self._compressor is not None and extracted:
+                    if any(layer.get("_tq_compressed") for layer in extracted):
+                        try:
+                            from .cache.turboquant import decompress_extracted_cache
+                            extracted = decompress_extracted_cache(
+                                extracted, self._compressor
+                            )
+                        except Exception as e:
+                            logger.warning(f"KV decompression failed: {e}")
+                return extracted, mcc
             return None, None
 
     def remove(self, session_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -231,9 +250,21 @@ class SessionManager:
         self,
         state_dir: Optional[Path] = None,
         default_ttl: float = 6 * 3600,
+        enable_kv_compression: bool = False,
+        kv_compression_bits: int = 3,
     ) -> None:
         self._manifests: Dict[str, SessionManifest] = {}
-        self._kv_store = SessionKVStore()
+        compressor = None
+        if enable_kv_compression:
+            try:
+                from .cache.turboquant import TurboQuant, TurboQuantConfig
+                compressor = TurboQuant(TurboQuantConfig(bits=kv_compression_bits))
+                logger.info(
+                    f"Session KV compression enabled: TurboQuant {kv_compression_bits}-bit"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize KV compression: {e}")
+        self._kv_store = SessionKVStore(compressor=compressor)
         self._state_dir = state_dir
         self._default_ttl = default_ttl
         self._locks: Dict[str, threading.Lock] = {}

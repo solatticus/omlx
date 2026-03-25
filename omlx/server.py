@@ -1020,7 +1020,10 @@ def init_server(
             global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
             / "sessions"
         )
-    _server_state.session_manager = SessionManager(state_dir=session_state_dir)
+    _server_state.session_manager = SessionManager(
+        state_dir=session_state_dir,
+        enable_kv_compression=True,
+    )
 
     # Set session route getters (deferred from module-level because
     # get_engine_for_model is defined after router includes)
