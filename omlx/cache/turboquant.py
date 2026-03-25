@@ -119,6 +119,7 @@ class TurboQuant:
         """
         d = x.shape[-1]
         orig_shape = x.shape
+        orig_dtype = x.dtype
         # Flatten to (N, d) for batch processing
         flat = x.reshape(-1, d).astype(mx.float32)
 
@@ -148,6 +149,7 @@ class TurboQuant:
             "indices": indices,
             "norms": norms.squeeze(-1).astype(mx.float16),
             "shape": mx.array(list(orig_shape), dtype=mx.int32),
+            "dtype": str(orig_dtype),
         }
 
     def decompress_tensor(self, compressed: Dict[str, mx.array]) -> mx.array:
@@ -176,6 +178,14 @@ class TurboQuant:
 
         # Rescale by original norms
         reconstructed = reconstructed * norms[:, None]
+
+        # Cast back to original dtype (e.g., bfloat16) to avoid
+        # 2x memory bloat and slower attention during generation
+        orig_dtype_str = compressed.get("dtype", "mlx.core.float32")
+        if "bfloat16" in orig_dtype_str:
+            reconstructed = reconstructed.astype(mx.bfloat16)
+        elif "float16" in orig_dtype_str:
+            reconstructed = reconstructed.astype(mx.float16)
 
         return reconstructed.reshape(orig_shape)
 
