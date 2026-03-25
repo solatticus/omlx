@@ -591,6 +591,21 @@ class SessionManager:
 
         manifest.state = SessionState.PARKING
 
+        # Decompress if TurboQuant compressed — park stores raw tensors
+        # (SSD space is cheap, clean round-trip is more important)
+        if any(layer.get("_tq_compressed") for layer in extracted):
+            try:
+                from .cache.turboquant import decompress_extracted_cache
+                extracted = decompress_extracted_cache(
+                    extracted, self._kv_store._compressor
+                )
+                logger.debug(f"Park {session_id}: decompressed KV for serialization")
+            except Exception as e:
+                logger.error(f"Park {session_id}: decompression failed: {e}")
+                self._kv_store.put(session_id, extracted, mcc)
+                manifest.state = SessionState.ACTIVE
+                return False
+
         if self._state_dir is None:
             logger.error(f"Park {session_id}: no state_dir configured")
             self._kv_store.put(session_id, extracted, mcc)
@@ -705,6 +720,7 @@ class SessionManager:
                 manifest.state = SessionState.PARKED
                 return False
 
+            # put() will recompress via TurboQuant if compressor is active
             self._kv_store.put(session_id, extracted)
             manifest.state = SessionState.ACTIVE
             manifest.last_active = time.time()
@@ -713,10 +729,12 @@ class SessionManager:
             tensor_bytes = sum(
                 t.nbytes for t in tensors.values() if hasattr(t, "nbytes")
             )
+            mem_bytes = self._kv_store.session_size(session_id)
             logger.info(
                 f"Session {session_id} resumed "
                 f"({manifest.total_tokens} tokens, "
-                f"{tensor_bytes / (1024*1024):.1f}MB from {kv_dir})"
+                f"{tensor_bytes / (1024*1024):.1f}MB from SSD, "
+                f"{mem_bytes / (1024*1024):.1f}MB in memory)"
             )
             return True
 
