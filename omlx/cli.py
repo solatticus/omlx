@@ -222,6 +222,8 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         api_key=settings.auth.api_key,
         global_settings=settings,
+        kv_compress_bits=args.kv_compress_bits,
+        session_ttl=args.session_ttl,
     )
 
     # Start server
@@ -465,6 +467,21 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+
+    # Session options
+    serve_parser.add_argument(
+        "--kv-compress-bits",
+        type=int,
+        default=3,
+        choices=[0, 2, 3, 4],
+        help="TurboQuant KV compression bits per coordinate (0=disabled, 2/3/4). Default: 3",
+    )
+    serve_parser.add_argument(
+        "--session-ttl",
+        type=int,
+        default=21600,
+        help="Session TTL in seconds before auto-expiry (default: 21600 = 6 hours)",
     )
 
     # MCP options

@@ -980,6 +980,8 @@ def init_server(
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
+    kv_compress_bits: int = 3,
+    session_ttl: int = 21600,
 ):
     """
     Initialize server with model directories for multi-model serving.
@@ -1023,7 +1025,9 @@ def init_server(
         )
     _server_state.session_manager = SessionManager(
         state_dir=session_state_dir,
-        enable_kv_compression=True,
+        default_ttl=float(session_ttl),
+        enable_kv_compression=kv_compress_bits > 0,
+        kv_compression_bits=kv_compress_bits if kv_compress_bits > 0 else 3,
     )
 
     # Set session route getters (deferred from module-level because

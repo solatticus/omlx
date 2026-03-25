@@ -138,9 +138,17 @@ class SessionKVStore:
         if self._compressor is not None:
             try:
                 from .cache.turboquant import compress_extracted_cache
+                pre_size = self._estimate_size(extracted_cache)
                 extracted_cache = compress_extracted_cache(
                     extracted_cache, self._compressor
                 )
+                post_size = self._estimate_size(extracted_cache)
+                if pre_size > 0:
+                    ratio = pre_size / post_size if post_size > 0 else 0
+                    logger.debug(
+                        f"KV compressed: {pre_size/(1024*1024):.1f}MB -> "
+                        f"{post_size/(1024*1024):.1f}MB ({ratio:.1f}x)"
+                    )
             except Exception as e:
                 logger.warning(f"KV compression failed, storing uncompressed: {e}")
         size = self._estimate_size(extracted_cache)
@@ -174,7 +182,15 @@ class SessionKVStore:
                                 extracted, self._compressor
                             )
                         except Exception as e:
-                            logger.warning(f"KV decompression failed: {e}")
+                            logger.warning(
+                                f"KV decompression failed for {session_id}: {e}. "
+                                f"Session cache invalidated — will re-prefill."
+                            )
+                            # Invalidate corrupted cache so caller falls
+                            # back to full prefill instead of crashing
+                            self._store.pop(session_id, None)
+                            self._total_bytes -= self._sizes.pop(session_id, 0)
+                            return None, None
                 return extracted, mcc
             return None, None
 
@@ -623,9 +639,11 @@ class SessionManager:
             tensors, layer_meta = self._flatten_extracted_to_tensors(extracted)
 
             if tensors:
-                mx.save_safetensors(
-                    str(kv_dir / "tensors.safetensors"), tensors
-                )
+                # Atomic write: save to tmp then rename
+                tmp_tensors = str(kv_dir / ".tensors.tmp.safetensors")
+                final_tensors = str(kv_dir / "tensors.safetensors")
+                mx.save_safetensors(tmp_tensors, tensors)
+                os.replace(tmp_tensors, final_tensors)
 
             # Save structure metadata
             meta = {
