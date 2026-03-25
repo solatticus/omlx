@@ -20,9 +20,36 @@
   <a href="#install">Install</a> ·
   <a href="#sessions">Sessions</a> ·
   <a href="#turboquant">TurboQuant</a> ·
+  <a href="#benchmark-results">Benchmarks</a> ·
   <a href="#features">All Features</a> ·
   <a href="#cli-configuration">CLI Configuration</a>
 </p>
+
+---
+
+> ### Recent: dtype fix turns a 2x slowdown into a 16% speedup
+>
+> The benchmark suite caught a critical bug: TurboQuant was decompressing
+> KV tensors to float32 instead of the model's native bfloat16. Every
+> decode step ran at half speed with double memory. One-line fix — store
+> the original dtype during compression, cast back on decompression.
+>
+> **Before fix** (float32 KV):
+> ```
+> 8-turn session total: 50.6s (87% SLOWER than stateless)
+> ```
+> **After fix** (bfloat16 KV):
+> ```
+> 8-turn session total: 32.3s (16% FASTER than stateless)
+> Turn 8: 87% cache hit, 2.74s vs 3.16s stateless
+> Memory: 45MB compressed (was 155MB uncompressed)
+> Park: 0.12s to SSD | Resume: instant
+> ```
+>
+> This is what benchmarks are for. Functional tests passed — every cache
+> hit was correct, every response was valid. But the model was doing
+> attention in float32 instead of bfloat16 and nobody would have noticed
+> without wall-clock timing.
 
 ---
 
@@ -194,7 +221,41 @@ Tested on Qwen3.5-VL-122B-A10B (MoE, head_dim 128/256):
 - **4x compression** (3-bit indices stored as uint8)
 - **MSE 0.034** (theoretical bound: 0.043)
 - **Zero quality degradation** on multi-turn conversations
-- Enabled by default, no configuration needed
+- Enabled by default, configurable via `--kv-compress-bits 0/2/3/4`
+
+## Benchmark Results
+
+8-turn coding conversation on Qwen3.5-VL-122B-A10B-4bit-CRACK (M3 Ultra, 96GB):
+
+```
+Turn  Stateless          Session + TurboQuant
+      time   prompt hit  time   ttft   prompt cached  hit
+  1  18.13s     56   0%  13.89s 0.216s     56      0   0%
+  2   2.65s    126   0%   2.64s 0.352s    126     54  42%
+  3   2.74s    181   0%   2.58s 0.288s    181    124  68%
+  4   2.83s    253   0%   2.63s 0.329s    253    179  70%
+  5   2.91s    318   0%   2.62s 0.319s    318    251  78%
+  6   3.01s    396   0%   2.64s 0.337s    396    316  79%
+  7   3.08s    452   0%   2.60s 0.292s    452    394  87%
+  8   3.16s    515   0%   2.74s 0.423s    515    450  87%
+                -----                       -----
+Total: 38.5s              32.3s (+16% faster)
+
+Session memory: 45.4 MB (TurboQuant 3-bit compressed)
+Park to SSD: 0.12s | Resume: instant
+```
+
+Cache hits compound every turn. By turn 8, 87% of the prompt is served from
+session KV cache. Sessions are faster than stateless at ~500 tokens — the gap
+widens with longer conversations.
+
+Run the benchmark yourself:
+```bash
+python scripts/benchmark_sessions.py \
+  --url http://localhost:8080 \
+  --model YOUR_MODEL \
+  --turns 10 --max-tokens 128
+```
 
 ---
 
