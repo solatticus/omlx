@@ -2586,17 +2586,14 @@ class Scheduler:
                     )
 
         # Check prefix cache for cached KV state
-        elif self.block_aware_cache is not None:
-            # Use paged cache
-            # Build extra_keys for VLM image hash prefix cache isolation
-            extra_keys = None
-            if request.vlm_image_hash:
-                extra_keys = (request.vlm_image_hash,)
-
+        # Skip SSD prefix cache for VLM requests — unique images produce
+        # zero cache hits, and VLM KV tensors have different shapes than
+        # text-only blocks (MoE shared vs expert attention heads).
+        elif self.block_aware_cache is not None and not request.vlm_image_hash:
+            # Use paged cache (text-only requests only)
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
-                extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -3864,7 +3861,11 @@ class Scheduler:
                             # Fall through — _extracted_cache still set,
                             # normal SSD storage proceeds as backup
 
-                    if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
+                    if (
+                        hasattr(request, '_extracted_cache')
+                        and request._extracted_cache is not None
+                        and not request.vlm_image_hash  # Skip SSD cache for VLM (unique images, shape mismatch risk)
+                    ):
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
                             # For reasoning models, only cache prompt tokens.

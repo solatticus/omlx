@@ -78,8 +78,11 @@ def compute_block_hash(
     # Include token content
     hasher.update(bytes(str(tuple(token_ids)), "utf-8"))
 
-    # Include extra keys if present
+    # Include extra keys if present (e.g., VLM image hash).
+    # This ensures VLM blocks never collide with text-only blocks even
+    # if token IDs overlap — VLM KV tensors have different shapes.
     if extra_keys:
+        hasher.update(b"vlm:")
         hasher.update(bytes(str(extra_keys), "utf-8"))
 
     return BlockHash(hasher.digest())
