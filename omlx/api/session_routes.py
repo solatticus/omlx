@@ -90,6 +90,8 @@ class SessionChatResponse(BaseModel):
     usage: Dict[str, int] = {}
     turn: int = 0
     cached_tokens: int = 0
+    resumed: bool = False
+    resume_time: Optional[float] = None
 
 class SessionInfo(BaseModel):
     session_id: str
@@ -189,20 +191,31 @@ async def session_chat(
     manifest = mgr.get_session(session_id)
     if manifest is None:
         raise HTTPException(404, f"Session {session_id} not found")
-    if manifest.state.value == "parked":
-        raise HTTPException(409, "Session is parked. POST /v1/sessions/{id}/resume first.")
     if manifest.state.value in ("parking", "resuming"):
         raise HTTPException(409, f"Session is {manifest.state.value}. Try again shortly.")
 
     # Acquire per-session lock (sequential turns)
     lock = mgr.acquire_session_lock(session_id)
     try:
-        return await _do_session_chat(mgr, manifest, request, http_request)
+        # Auto-resume parked sessions — transparent to the client
+        resume_info = None
+        if manifest.state.value == "parked":
+            t0 = time.time()
+            success = mgr.resume_session(session_id)
+            if not success:
+                raise HTTPException(500, f"Auto-resume failed for session {session_id}")
+            resume_time = time.time() - t0
+            logger.info(f"Auto-resumed session {session_id} in {resume_time:.3f}s")
+            resume_info = resume_time
+            # Refresh manifest after resume
+            manifest = mgr.get_session(session_id)
+
+        return await _do_session_chat(mgr, manifest, request, http_request, resume_info=resume_info)
     finally:
         lock.release()
 
 
-async def _do_session_chat(mgr, manifest, request, http_request):
+async def _do_session_chat(mgr, manifest, request, http_request, resume_info=None):
     """Session chat using engine's public API."""
     engine = await _get_engine_for_model(manifest.model_name)
     messages = request.messages
@@ -230,7 +243,7 @@ async def _do_session_chat(mgr, manifest, request, http_request):
 
     if request.stream:
         return StreamingResponse(
-            _stream_session_chat(engine, messages, kwargs, manifest, mgr, request.tools),
+            _stream_session_chat(engine, messages, kwargs, manifest, mgr, request.tools, resume_info=resume_info),
             media_type="text/event-stream",
         )
 
@@ -254,13 +267,16 @@ async def _do_session_chat(mgr, manifest, request, http_request):
         },
         turn=m.turn_count if m else manifest.turn_count,
         cached_tokens=output.cached_tokens if hasattr(output, "cached_tokens") else 0,
+        resumed=resume_info is not None,
+        resume_time=resume_info,
     )
 
 
-async def _stream_session_chat(engine, messages, kwargs, manifest, mgr, tools=None):
+async def _stream_session_chat(engine, messages, kwargs, manifest, mgr, tools=None, resume_info=None):
     """SSE streaming for session chat, delegating to engine.stream_chat()."""
     full_text = ""
     last_chunk = None
+    is_first = True
     try:
         async for chunk in engine.stream_chat(messages=messages, tools=tools, **kwargs):
             full_text += chunk.new_text
@@ -269,6 +285,10 @@ async def _stream_session_chat(engine, messages, kwargs, manifest, mgr, tools=No
                 "content": chunk.new_text,
                 "finished": chunk.finished,
             }
+            if is_first and resume_info is not None:
+                data["resumed"] = True
+                data["resume_time"] = round(resume_info, 3)
+                is_first = False
             if chunk.finished:
                 last_chunk = chunk
                 data["finish_reason"] = chunk.finish_reason
