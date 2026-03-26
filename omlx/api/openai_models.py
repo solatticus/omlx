@@ -133,7 +133,7 @@ class StreamOptions(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
-    model: str
+    model: Optional[str] = None
     messages: List[Message]
     temperature: float | None = None
     top_p: float | None = None
@@ -217,7 +217,7 @@ class ChatCompletionResponse(BaseModel):
 
 class CompletionRequest(BaseModel):
     """Request for text completion."""
-    model: str
+    model: Optional[str] = None
     prompt: Union[str, List[str]]
     temperature: float | None = None
     top_p: float | None = None

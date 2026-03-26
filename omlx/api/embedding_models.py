@@ -23,8 +23,8 @@ class EmbeddingRequest(BaseModel):
     input: Union[str, List[str]]
     """Input text(s) to embed. Can be a single string or list of strings."""
 
-    model: str
-    """ID of the model to use."""
+    model: str | None = None
+    """ID of the model to use. Defaults to the server's loaded model."""
 
     encoding_format: Literal["float", "base64"] = "float"
     """

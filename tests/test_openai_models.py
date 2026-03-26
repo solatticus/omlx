@@ -296,12 +296,12 @@ class TestChatCompletionRequest:
         assert len(req.tools) == 1
         assert req.tool_choice == "auto"
 
-    def test_request_validation_requires_model(self):
-        """Test that model is required."""
-        with pytest.raises(ValidationError):
-            ChatCompletionRequest(
-                messages=[Message(role="user", content="Hello")],
-            )
+    def test_request_model_defaults_to_none(self):
+        """Test that model defaults to None (server uses default model)."""
+        req = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hello")],
+        )
+        assert req.model is None
 
     def test_request_validation_requires_messages(self):
         """Test that messages is required."""

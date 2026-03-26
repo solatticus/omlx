@@ -135,7 +135,7 @@ class ThinkingConfig(BaseModel):
 class MessagesRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
-    model: str
+    model: str | None = None
     max_tokens: int
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
@@ -160,7 +160,7 @@ class MessagesRequest(BaseModel):
 class TokenCountRequest(BaseModel):
     """Request for token counting (Anthropic format)."""
 
-    model: str
+    model: str | None = None
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
     tools: list[AnthropicTool] | None = None

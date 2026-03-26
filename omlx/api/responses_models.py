@@ -78,7 +78,7 @@ class TextConfig(BaseModel):
 class ResponsesRequest(BaseModel):
     """Request body for POST /v1/responses."""
 
-    model: str
+    model: Optional[str] = None
     input: Optional[Union[str, List[InputItem]]] = None
     instructions: Optional[str] = None
     temperature: Optional[float] = None

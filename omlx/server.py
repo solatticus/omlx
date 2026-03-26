@@ -974,6 +974,24 @@ def validate_context_window(
         )
 
 
+def clamp_max_tokens(
+    max_tokens: int, num_prompt_tokens: int, model_id: str | None = None
+) -> int:
+    """
+    Clamp max_tokens so prompt + output stays within the context window.
+
+    Returns the (possibly reduced) max_tokens value.
+    """
+    max_ctx = get_max_context_window(model_id)
+    if max_ctx:
+        remaining = max_ctx - num_prompt_tokens
+        if remaining <= 0:
+            return 0
+        if max_tokens > remaining:
+            return remaining
+    return max_tokens
+
+
 def init_server(
     model_dirs: str | list[str],
     max_model_memory: int | None,
@@ -1698,6 +1716,8 @@ async def create_completion(
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
+    if request.model is None:
+        request.model = _server_state.default_model
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -1731,6 +1751,9 @@ async def create_completion(
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
     )
+    # Clamp per-prompt (use longest prompt for conservative bound)
+    max_prompt_tokens = max(len(engine.tokenizer.encode(p)) for p in prompts)
+    max_tokens = clamp_max_tokens(max_tokens, max_prompt_tokens, request.model)
 
     for i, prompt in enumerate(prompts):
         output = await _run_with_disconnect_guard(
@@ -1829,6 +1852,10 @@ async def create_chat_completion(
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
+    # Normalize: fill in default model name so downstream code always has a string
+    if request.model is None:
+        request.model = _server_state.default_model
+
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
 
@@ -1910,6 +1937,7 @@ async def create_chat_completion(
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
     )
+    max_tokens = clamp_max_tokens(max_tokens, num_prompt_tokens, request.model)
     chat_kwargs = {
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -2778,6 +2806,8 @@ async def create_anthropic_message(
         )
 
     engine = await get_engine_for_model(request.model)
+    if request.model is None:
+        request.model = _server_state.default_model
 
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
@@ -2830,6 +2860,7 @@ async def create_anthropic_message(
         request.temperature, request.top_p, request.model,
         req_max_tokens=request.max_tokens,
     )
+    max_tokens = clamp_max_tokens(max_tokens, num_prompt_tokens, request.model)
 
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -2999,6 +3030,8 @@ async def count_anthropic_tokens(
         )
 
     engine = await get_engine_for_model(request.model)
+    if request.model is None:
+        request.model = _server_state.default_model
 
     # Convert Anthropic format to internal format
     # Create a temporary MessagesRequest to reuse existing conversion logic
@@ -3115,6 +3148,8 @@ async def create_response(
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
+    if request.model is None:
+        request.model = _server_state.default_model
 
     resolved_model = resolve_model_id(request.model) or request.model
 
@@ -3209,6 +3244,7 @@ async def create_response(
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = (
         get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
     )
+    max_tokens = clamp_max_tokens(max_tokens, num_prompt_tokens, request.model)
     chat_kwargs = {
         "max_tokens": max_tokens,
         "temperature": temperature,

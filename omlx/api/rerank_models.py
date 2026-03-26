@@ -18,8 +18,8 @@ class RerankRequest(BaseModel):
     Cohere/Jina-compatible request format for the /v1/rerank endpoint.
     """
 
-    model: str
-    """ID of the model to use."""
+    model: str | None = None
+    """ID of the model to use. Defaults to the server's loaded model."""
 
     query: str
     """The search query to compare documents against."""
