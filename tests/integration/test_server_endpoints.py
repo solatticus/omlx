@@ -1030,9 +1030,8 @@ class TestMCPEndpoints:
 class TestErrorHandling:
     """Tests for error handling in endpoints."""
 
-    def test_missing_model(self, client):
-        """Test error when model is not specified."""
-        # For Anthropic endpoint, missing model should raise validation error
+    def test_missing_model_uses_default(self, client):
+        """Test that omitting model uses the server's default model."""
         response = client.post(
             "/v1/messages",
             json={
@@ -1041,7 +1040,7 @@ class TestErrorHandling:
             },
         )
 
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 200
 
     def test_empty_messages(self, client):
         """Test error when messages is empty."""

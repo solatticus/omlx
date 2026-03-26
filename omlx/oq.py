@@ -130,10 +130,10 @@ def universal_quant_predicate(
         }
 
     if _is_moe_router(path):
-        return False
+        return {"bits": 8, "group_size": 64, "mode": "affine"}
 
     if "shared_expert_gate" in path and "gate_proj" not in path:
-        return False
+        return {"bits": 8, "group_size": 64, "mode": "affine"}
 
     if _is_vision_tensor(path):
         return False
@@ -456,11 +456,15 @@ def _build_quant_plan(
     max_layer_score = max(layer_scores.values(), default=0.0)
 
     total_params = 0
-    for shape in named_shapes.values():
+    expert_params = 0
+    for path, shape in named_shapes.items():
         n = 1
         for dim in shape:
             n *= dim
         total_params += n
+        if _is_routed_expert(path):
+            expert_params += n
+    is_dense = expert_params / max(total_params, 1) < 0.5
 
     current_bpw = _estimate_effective_bpw(
         named_shapes, base_bits, base_group_size, base_mode
@@ -519,6 +523,74 @@ def _build_quant_plan(
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
 
+    # Dense model MLP asymmetry: gate/down → base+1, up → base-1
+    # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
+    # protection, while up_proj (linear multiplicand) tolerates lower bits.
+    # Budget-approximately-neutral: 2 tensors boosted, 1 reduced.
+    _VALID_BITS_SET = {2, 3, 4, 5, 6, 8}
+    if is_dense and base_bits >= 3:
+        reduce_bits = max(base_bits - 1, 2)
+        boost_bits = base_bits + 1
+        while boost_bits not in _VALID_BITS_SET and boost_bits < 8:
+            boost_bits += 1
+        can_asymmetry = (
+            reduce_bits in _VALID_BITS_SET
+            and reduce_bits < base_bits
+            and boost_bits in _VALID_BITS_SET
+            and boost_bits > base_bits
+        )
+        if can_asymmetry:
+            # Pass 1: reduce up_proj → free budget
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if "up_proj" not in path or "gate" in path:
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(reduce_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(reduce_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, reduce_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)  # negative
+                boost_map[path] = {"bits": reduce_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = total_bits_f / total_params
+
+            # Pass 2: boost gate/down_proj → use freed budget (with cap check)
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if not any(p in path for p in ("gate_proj", "down_proj", "wo")):
+                    continue
+                if _extract_layer_index(path) < 0:
+                    continue
+                pred = universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                if pred is False:
+                    continue
+                cand_gs = _gs_for_mode(boost_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_mode = _mode_for_bits(boost_bits)
+                old_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                new_cost = _tensor_quantized_bytes(shape, boost_bits, cand_gs, cand_mode)
+                delta = 8 * (new_cost - old_cost)
+                next_bpw = (total_bits_f + delta) / total_params
+                if next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {"bits": boost_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = next_bpw
+
     candidates = []
     for path, shape in named_shapes.items():
         if path in boost_map:
@@ -532,6 +604,9 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
+            continue
+        # Dense: skip MLP tensors (already handled by asymmetry)
+        if is_dense and any(p in path for p in ("gate_proj", "up_proj", "down_proj", "wo")):
             continue
         layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         max_extra = _sensitivity_tier(layer_score, max_layer_score)
@@ -549,8 +624,9 @@ def _build_quant_plan(
             cand_bits = min(base_bits + extra, 8)
             if cand_bits <= base_bits:
                 continue
-            while cand_bits not in _VALID_BITS and cand_bits > base_bits:
-                cand_bits -= 1
+            # Round UP to next valid bit width (e.g. 7 -> 8, not 7 -> 6)
+            while cand_bits not in _VALID_BITS and cand_bits < 8:
+                cand_bits += 1
             if cand_bits <= base_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -598,18 +674,18 @@ def resolve_output_name(model_name: str, oq_level: int,
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 -> "Qwen3.5-122B-A10B-oQ4"
-        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4+"
+        "Qwen3.5-122B-A10B" + 4 + clip -> "Qwen3.5-122B-A10B-oQ4e"
         "Qwen3.5-122B-A10B-8bit" + 4 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B-oQ6" + 2 -> "Qwen3.5-122B-A10B-oQ2"
     """
     base = re.sub(
-        r"-(oQ[\d.]+\+?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
         "",
         model_name,
         flags=re.IGNORECASE,
     )
     level_str = f"{oq_level:g}"
-    suffix = f"oQ{level_str}+" if enable_clip else f"oQ{level_str}"
+    suffix = f"oQ{level_str}e" if enable_clip else f"oQ{level_str}"
     return f"{base}-{suffix}"
 
 
@@ -1112,8 +1188,14 @@ def quantize_oq_streaming(
                     layer_cfg["mode"] = qmode
                     per_layer_config[base] = layer_cfg
             else:
+                # Cast float32 non-quantized weights to bfloat16 (match mlx-lm)
+                if w_mx.dtype == mx.float32 and mx.issubdtype(w_mx.dtype, mx.floating):
+                    w_mx = w_mx.astype(mx.bfloat16)
                 out_shard_data[tensor_name] = w_mx
         else:
+            # Cast float32 non-quantized weights to bfloat16 (match mlx-lm)
+            if w_mx.dtype == mx.float32 and mx.issubdtype(w_mx.dtype, mx.floating):
+                w_mx = w_mx.astype(mx.bfloat16)
             out_shard_data[tensor_name] = w_mx
 
         del w_mx
@@ -1200,6 +1282,28 @@ def quantize_oq_streaming(
         for key in ("vision_config", "image_token_id", "video_token_id",
                      "vision_start_token_id", "vision_end_token_id"):
             output_config.pop(key, None)
+    # Ensure eos_token_id is present (mlx-lm adds it from tokenizer)
+    if "eos_token_id" not in output_config:
+        try:
+            from transformers import AutoTokenizer
+            _tok = AutoTokenizer.from_pretrained(str(source))
+            if hasattr(_tok, "eos_token_id") and _tok.eos_token_id is not None:
+                # Some models have multiple EOS tokens
+                eos_ids = getattr(_tok, "additional_special_tokens_ids", [])
+                if _tok.eos_token_id not in eos_ids:
+                    eos_ids = [_tok.eos_token_id] + eos_ids
+                # Check generation_config for eos_token_id list
+                gen_config_path = source / "generation_config.json"
+                if gen_config_path.exists():
+                    with open(gen_config_path) as f:
+                        gen_cfg = json.load(f)
+                    if "eos_token_id" in gen_cfg:
+                        output_config["eos_token_id"] = gen_cfg["eos_token_id"]
+                        logger.info(f"Added eos_token_id from generation_config: {gen_cfg['eos_token_id']}")
+                elif eos_ids:
+                    output_config["eos_token_id"] = eos_ids if len(eos_ids) > 1 else eos_ids[0]
+        except Exception as e:
+            logger.debug(f"Could not resolve eos_token_id: {e}")
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
@@ -1234,7 +1338,6 @@ def quantize_oq_streaming(
     )
 
 
-_CLIP_MAX_BITS = 4
 _CLIP_NUM_SAMPLES = 128
 _CLIP_SEQ_LENGTH = 512
 _CLIP_N_GRID = 20
@@ -1613,28 +1716,33 @@ def _layer_masks_for_model(model, layers, inputs):
             cache = model.make_cache()
             fa_idx = getattr(getattr(model, "model", model), "fa_idx", 0)
             ssm_idx = getattr(getattr(model, "model", model), "ssm_idx", 0)
-            fa_mask = create_attention_mask(inputs, cache[fa_idx] if fa_idx < len(cache) else None)
-            ssm_mask = create_ssm_mask(inputs, cache[ssm_idx] if ssm_idx < len(cache) else None)
-            return [ssm_mask if getattr(layer, "is_linear", False) else fa_mask for layer in layers]
-        except Exception:
-            logger.debug("Falling back to additive causal masks for calibration", exc_info=True)
+            fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
+            ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
+            try:
+                fa_mask = create_attention_mask(inputs, fa_cache)
+            except TypeError:
+                # mlx-lm API changed — cache.make_mask signature differs
+                fa_mask = None
+            try:
+                ssm_mask = create_ssm_mask(inputs, ssm_cache)
+            except TypeError:
+                ssm_mask = None
+            if fa_mask is not None or ssm_mask is not None:
+                if fa_mask is None:
+                    fa_mask = nn.MultiHeadAttention.create_additive_causal_mask(
+                        inputs.shape[1]
+                    ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
+                # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
+                # (S, S) causal mask.  During calibration there is no padding,
+                # so None is the correct mask for SSM layers.
+                return [ssm_mask if getattr(layer, "is_linear", False) else fa_mask for layer in layers]
+        except (ImportError, AttributeError):
+            pass
 
     seq_len = inputs.shape[1]
     mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
     dtype = inputs.dtype if hasattr(inputs, "dtype") else mx.float16
     return [mask.astype(dtype)] * len(layers)
-
-
-def _resolve_submodule(module, key: str):
-    """Resolve dotted submodule paths on MLX modules."""
-    for part in key.split("."):
-        if part.isdigit():
-            module = module[int(part)]
-        elif hasattr(module, part):
-            module = getattr(module, part)
-        else:
-            module = module[part]
-    return module
 
 
 def _capture_block_module_inputs(block, block_inputs, mask, position_ids):
@@ -1706,46 +1814,525 @@ def _capture_block_module_inputs(block, block_inputs, mask, position_ids):
     return outputs, captured
 
 
-def _captured_mean_abs(x) -> Any:
-    """Channel-wise activation magnitude from captured module input."""
-    flat = x.astype(mx.float32).reshape(-1, x.shape[-1])
-    return flat.abs().mean(axis=0)
+def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
+    """Compute Hessian H = X^T X and its inverse via Cholesky.
+
+    For large in_dim (e.g. 17408 for down_proj), the final matmul
+    Linv.T @ Linv is split into column blocks to avoid Metal GPU timeout.
+
+    Args:
+        X: Calibration inputs (n_tokens, in_dim), float32.
+        damp: Dampening factor for diagonal.
+
+    Returns:
+        (H, Hinv) both (in_dim, in_dim) float32.
+    """
+    n = X.shape[1]
+    H = (X.T @ X).astype(mx.float32)
+    diag_mean = mx.diag(H).mean()
+    H = H + damp * diag_mean * mx.eye(n)
+    mx.eval(H)
+    L = mx.linalg.cholesky(H, stream=mx.cpu)
+    I = mx.eye(n)
+    Linv = mx.linalg.solve_triangular(L, I, upper=False, stream=mx.cpu)
+    mx.eval(Linv)
+
+    # Chunked matmul to prevent Metal GPU timeout on large matrices.
+    # (17408, 17408) @ (17408, 17408) = 5.3T ops → single dispatch timeout.
+    _CHUNK = 4096
+    if n <= _CHUNK:
+        Hinv = Linv.T @ Linv
+        mx.eval(Hinv)
+    else:
+        chunks = []
+        for i in range(0, n, _CHUNK):
+            j = min(i + _CHUNK, n)
+            chunk = Linv.T @ Linv[:, i:j]
+            mx.eval(chunk)
+            chunks.append(chunk)
+        Hinv = mx.concatenate(chunks, axis=1)
+        mx.eval(Hinv)
+
+    return H, Hinv
 
 
-def _router_usage_from_inputs(router, x, top_k: int, norm_topk_prob: bool) -> Any:
-    """Estimate expert usage from router probabilities for calibration inputs."""
-    gates = router(x)
-    gates = mx.softmax(gates, axis=-1, precise=True)
-    inds = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
-    scores = mx.take_along_axis(gates, inds, axis=-1)
-    if norm_topk_prob:
-        scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-6)
-    usage = mx.zeros((gates.shape[-1],), dtype=mx.float32)
-    for slot in range(top_k):
-        usage = usage.at[inds[..., slot].reshape(-1)].add(
-            scores[..., slot].reshape(-1).astype(mx.float32)
-        )
-    usage = usage / mx.maximum(usage.sum(), 1e-6)
-    return usage, inds, scores
+def _compute_group_params(group_slice: Any, bits: int, group_size: int):
+    """Compute affine quantization scale/bias for a group slice.
 
+    Handles partial last group by padding to group_size so mx.quantize
+    accepts the tensor.
 
-def _forward_captured_module(module, captured: CapturedInput):
-    """Replay a module using the captured inputs from the float forward."""
-    if captured.indices is not None:
-        return module(captured.value, captured.indices)
-    return module(captured.value)
+    Args:
+        group_slice: Weight group (..., g_size) where g_size <= group_size.
+        bits: Quantization bits.
+        group_size: Target group size for mx.quantize.
 
-
-def _forward_sparse_moe_routed(mlp, x):
-    """Replay only the routed expert path of a Qwen3.5 sparse MoE block."""
-    top_k = int(getattr(mlp, "top_k", getattr(mlp, "num_experts_per_tok", 1)))
-    norm_topk_prob = getattr(mlp, "norm_topk_prob", top_k > 1)
-    usage, inds, scores = _router_usage_from_inputs(
-        mlp.gate, x, top_k, norm_topk_prob
+    Returns:
+        (scales, biases) each with shape (..., 1).
+    """
+    actual_width = group_slice.shape[-1]
+    if actual_width < group_size:
+        pad_width = group_size - actual_width
+        pad_spec = [(0, 0)] * (group_slice.ndim - 1) + [(0, pad_width)]
+        group_slice = mx.pad(group_slice, pad_spec)
+    _, scales, *rest = mx.quantize(
+        group_slice, bits=bits, group_size=group_size
     )
-    routed = mlp.switch_mlp(x, inds)
-    routed = (routed * scores[..., None]).sum(axis=-2)
-    return routed, usage
+    biases = rest[0] if rest else mx.zeros_like(scales)
+    return scales, biases
+
+
+def _gptq_quantize_weight(
+    w: Any, Hinv: Any, bits: int, group_size: int, mode: str = "affine",
+    block_size: int = 32,
+) -> Any:
+    """GPTQ column-by-column quantization with error compensation.
+
+    Processes columns in group_size-aligned blocks so that the simulated
+    quantization matches mx.quantize's row-wise grouping (groups along
+    the last axis / in_dim).  Scale and bias are computed once per group
+    from the current weight state, then each column is analytically
+    quantize-dequantized using the fixed group parameters.
+
+    Args:
+        w: Weight tensor (out_dim, in_dim) float32.
+        Hinv: Inverse Hessian (in_dim, in_dim) float32.
+        bits: Target quantization bits.
+        group_size: Quantization group size.
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
+
+    Returns:
+        GPTQ-optimized weight (out_dim, in_dim).
+    """
+    out_dim, in_dim = w.shape
+    W = mx.array(w)
+    n_bins = 2**bits - 1
+
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
+
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, g_start:g_end]  # (out_dim, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (out_dim, 1), biases: (out_dim, 1)
+
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, g_start + i] for i in range(g_size)]
+        err_list = []
+
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
+
+        for i in range(g_size):
+            col = group_cols[i]  # (out_dim,)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_2d = col[:, None]  # (out_dim, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_2d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (out_dim,)
+
+            err = (col - qc) / d  # (out_dim,)
+            err_list.append(err)
+
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
+
+            group_cols[i] = qc
+
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
+
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=1)  # (out_dim, g_size)
+        W = mx.concatenate(
+            [W[:, :g_start], group_result, W[:, g_end:]], axis=1,
+        )
+
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=1)  # (out_dim, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]
+            W = mx.concatenate(
+                [W[:, :g_end], W[:, g_end:] - cross], axis=1,
+            )
+
+        mx.eval(W)
+
+    return W
+
+
+def _gptq_quantize_experts_batched(
+    w_3d: Any, Hinv: Any, bits: int, group_size: int, mode: str = "affine",
+    block_size: int = 32,
+) -> Any:
+    """Batched GPTQ across all experts simultaneously.
+
+    Group-aligned version: processes columns in group_size blocks matching
+    mx.quantize's row-wise grouping.  Scale/bias computed once per group
+    from current weight state; analytical qdq applied per column.
+
+    Args:
+        w_3d: Fused expert weights (num_experts, out_dim, in_dim) float32.
+        Hinv: Inverse Hessian (in_dim, in_dim) float32.
+        bits: Target quantization bits.
+        group_size: Quantization group size.
+        mode: Quantization mode (only "affine" fully supported).
+        block_size: Ignored (kept for API compatibility).
+
+    Returns:
+        GPTQ-optimized weights (num_experts, out_dim, in_dim).
+    """
+    num_experts, out_dim, in_dim = w_3d.shape
+    W = mx.array(w_3d)  # (E, O, I)
+    n_bins = 2**bits - 1
+
+    for g_start in range(0, in_dim, group_size):
+        g_end = min(g_start + group_size, in_dim)
+        g_size = g_end - g_start
+
+        # Compute scale/bias from current W group (groups along last axis)
+        group_slice = W[:, :, g_start:g_end]  # (E, O, g_size)
+        scales, biases = _compute_group_params(group_slice, bits, group_size)
+        # scales: (E, O, 1), biases: (E, O, 1)
+
+        # Work with column list for efficient in-loop updates
+        group_cols = [W[:, :, g_start + i] for i in range(g_size)]  # list of (E, O)
+        err_list = []
+
+        # Safe divisor: preserve sign, avoid division by zero
+        safe_scales = mx.where(
+            mx.abs(scales) < 1e-10, mx.array(1e-10), scales,
+        )
+
+        for i in range(g_size):
+            col = group_cols[i]  # (E, O)
+            k = g_start + i
+            d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+
+            # Analytical qdq matching mx.quantize affine mode
+            col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
+            q = mx.clip(
+                mx.round((col_3d - biases) / safe_scales),
+                0.0, n_bins,
+            )
+            qc = (scales * q + biases).squeeze(-1)  # (E, O)
+
+            err = (col - qc) / d  # (E, O)
+            err_list.append(err)
+
+            # Compensate remaining columns in this group
+            for j in range(i + 1, g_size):
+                group_cols[j] = group_cols[j] - err * Hinv[k, g_start + j]
+
+            group_cols[i] = qc
+
+            # Periodic eval to prevent Metal GPU timeout on large tensors
+            if (i + 1) % 16 == 0:
+                mx.eval(*group_cols)
+
+        # Reassemble the group into W
+        group_result = mx.stack(group_cols, axis=2)  # (E, O, g_size)
+        W = mx.concatenate(
+            [W[:, :, :g_start], group_result, W[:, :, g_end:]], axis=2,
+        )
+
+        # Cross-group compensation
+        if g_end < in_dim:
+            err_mat = mx.stack(err_list, axis=2)  # (E, O, g_size)
+            cross = err_mat @ Hinv[g_start:g_end, g_end:]  # (E, O, remaining)
+            W = mx.concatenate(
+                [W[:, :, :g_end], W[:, :, g_end:] - cross], axis=2,
+            )
+
+        mx.eval(W)
+
+    return W
+
+
+def _run_gptq(
+    model, tokenizer, config, oq_level,
+    progress_callback=None,
+    calib_dataset="code_multilingual",
+    num_samples=128, seq_length=256,
+):
+    """Run GPTQ optimization on all quantizable weights (experts + attention + MLP).
+
+    Layer-by-layer: capture per-module inputs, compute Hessian,
+    apply GPTQ column-by-column error compensation.
+    Modifies model weights in-place. No inference overhead.
+    """
+    cb = progress_callback or (lambda phase, pct: None)
+
+    calib_data = _load_calibration_data(
+        tokenizer, dataset=calib_dataset,
+        num_samples=num_samples, seq_length=seq_length,
+    )
+    if calib_data is None:
+        return
+
+    embed_fn, layers = _find_model_layers(model)
+    if embed_fn is None or layers is None:
+        logger.warning("Cannot find model layers, skipping GPTQ")
+        return
+
+    inputs = embed_fn(calib_data)
+    layer_masks = _layer_masks_for_model(model, layers, inputs)
+    position_ids = mx.arange(calib_data.shape[1])[None, :]
+    total_layers = len(layers)
+    optimized_count = 0
+    expert_count = 0
+    dense_count = 0
+    start_time = _time.monotonic()
+
+    base_bits = _base_bits_for_level(oq_level)
+    base_gs = _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE)
+    base_mode = _mode_for_bits(base_bits)
+
+    for layer_idx, block in enumerate(layers):
+        layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
+
+        # Capture per-module inputs for Hessian computation
+        logger.debug(f"  L{layer_idx}: capturing module inputs")
+        _, captured = _capture_block_module_inputs(
+            block, inputs, layer_mask, position_ids
+        )
+        logger.debug(f"  L{layer_idx}: captured {len(captured)} modules")
+
+        layer_opt = 0
+
+        # --- Dense (2D) weights: attention, shared_expert, dense MLP ---
+        # Cache Hessian per input source — tensors sharing the same input
+        # (e.g. gate_proj and up_proj both fed by layernorm output) get
+        # identical Hessians, so compute once and reuse.
+        _hinv_cache: dict[int, Any] = {}
+        boost_map = config.get("_oq_boost_map") or {}
+
+        for path, module in tree_flatten(
+            block.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            if not hasattr(module, "weight") or module.weight.ndim != 2:
+                continue
+            if not hasattr(module, "to_quantized"):
+                continue
+
+            w = module.weight
+            out_dim, in_dim = w.shape
+            if in_dim < 32:
+                continue
+
+            # Skip 1D norms, routers, etc.
+            norm_path = _normalize_quant_path(path)
+            if _is_moe_router(norm_path):
+                continue
+            if "shared_expert_gate" in norm_path and "gate_proj" not in norm_path:
+                continue
+            if any(p in norm_path for p in ("norm", "layernorm")):
+                continue
+
+            # Find captured input for this module
+            module_input = captured.get(path)
+            if module_input is None:
+                # Try partial match
+                short = path.split(".")[-1]
+                for cpath in captured:
+                    if cpath.endswith(short):
+                        module_input = captured[cpath]
+                        break
+            if module_input is None:
+                continue
+
+            # Reuse Hessian for shared input sources
+            inp_id = id(module_input)
+            if inp_id in _hinv_cache and _hinv_cache[inp_id].shape[0] == in_dim:
+                Hinv = _hinv_cache[inp_id]
+            else:
+                x_flat = module_input.value.astype(mx.float32).reshape(-1, in_dim)
+                if x_flat.shape[0] == 0:
+                    continue
+                mx.eval(x_flat)
+                _, Hinv = _gptq_compute_hessian(x_flat)
+                del x_flat
+                _hinv_cache[inp_id] = Hinv
+
+            bits = base_bits
+            for bkey in boost_map:
+                if f"layers.{layer_idx}.{path}" in bkey:
+                    bits = boost_map[bkey].get("bits", base_bits)
+                    break
+            gs = _gs_for_mode(bits, _OQ_DEFAULT_GROUP_SIZE)
+            mode = _mode_for_bits(bits)
+
+            logger.debug(f"  L{layer_idx}: GPTQ {path} ({out_dim}x{in_dim}) @ {bits}bit")
+            w_f32 = w.astype(mx.float32)
+            w_opt = _gptq_quantize_weight(
+                w_f32, Hinv, bits, gs, mode, block_size=32,
+            )
+            module.weight = w_opt.astype(w.dtype)
+            mx.eval(module.weight)
+            del w_f32, w_opt
+            layer_opt += 1
+            dense_count += 1
+
+        del _hinv_cache
+
+        # --- Fused 3D expert weights ---
+        for attr in ("mlp", "block_sparse_moe", "moe"):
+            mlp = getattr(block, attr, None)
+            if mlp is None:
+                continue
+
+            expert_targets = []
+            # SwitchLinear experts (Qwen3.5 MoE style)
+            sm = getattr(mlp, "switch_mlp", None)
+            if sm is not None:
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    proj = getattr(sm, proj_name, None)
+                    if proj is not None and hasattr(proj, "weight") and proj.weight.ndim == 3:
+                        expert_targets.append(("module", proj_name, proj))
+            # Direct fused tensor experts (Qwen3.5, GLM style)
+            experts_mod = getattr(mlp, "experts", None)
+            if experts_mod is not None:
+                for proj_name in ("gate_up_proj", "down_proj", "gate_proj", "up_proj"):
+                    w = getattr(experts_mod, proj_name, None)
+                    if w is not None and isinstance(w, mx.array) and w.ndim == 3:
+                        expert_targets.append(("attr", proj_name, (experts_mod, proj_name)))
+            # Direct fused projections on MoE module (Step-3.5 style: moe.gate_proj)
+            for proj_name in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+                proj = getattr(mlp, proj_name, None)
+                if proj is not None and hasattr(proj, "weight") and proj.weight.ndim == 3:
+                    expert_targets.append(("module", proj_name, proj))
+                elif proj is not None and isinstance(proj, mx.array) and proj.ndim == 3:
+                    expert_targets.append(("attr", proj_name, (mlp, proj_name)))
+
+            if not expert_targets:
+                continue
+
+            # Get MLP input for Hessian
+            mlp_input = None
+            for path_key in captured:
+                if "gate" in path_key or "up" in path_key or "down" in path_key:
+                    mlp_input = captured[path_key].value
+                    break
+            if mlp_input is None:
+                norm = getattr(block, "post_attention_layernorm", None)
+                if norm is not None:
+                    mlp_input = norm(inputs)
+            if mlp_input is None:
+                continue
+
+            mlp_flat = mlp_input.astype(mx.float32).reshape(-1, mlp_input.shape[-1])
+            mx.eval(mlp_flat)
+            _, Hinv_mlp = _gptq_compute_hessian(mlp_flat)
+            del mlp_flat
+
+            for target_type, proj_name, target_ref in expert_targets:
+                if target_type == "module":
+                    w_3d = target_ref.weight
+                else:
+                    container, attr_name = target_ref
+                    w_3d = getattr(container, attr_name)
+
+                num_experts = w_3d.shape[0]
+                expert_in_dim = w_3d.shape[2]
+
+                # Hessian for this projection's input dim
+                if expert_in_dim != Hinv_mlp.shape[0]:
+                    Hinv_exp = mx.eye(expert_in_dim)
+                else:
+                    Hinv_exp = Hinv_mlp
+
+                logger.debug(
+                    f"  L{layer_idx}: GPTQ {proj_name} ({num_experts} experts, "
+                    f"{w_3d.shape[1]}x{expert_in_dim}) @ {base_bits}bit"
+                )
+
+                # Batched GPTQ: all experts processed simultaneously
+                _t0 = _time.time()
+                new_3d = _gptq_quantize_experts_batched(
+                    w_3d.astype(mx.float32), Hinv_exp,
+                    base_bits, base_gs, base_mode, block_size=32,
+                )
+                new_3d = new_3d.astype(w_3d.dtype)
+                mx.eval(new_3d)
+                _elapsed = _time.time() - _t0
+
+                # Measure MSE improvement (sample 4 experts)
+                sample_idx = [0, num_experts // 3, num_experts * 2 // 3, num_experts - 1]
+                x_exp = mlp_input.astype(mx.float32).reshape(-1, mlp_input.shape[-1])
+                if x_exp.shape[1] != expert_in_dim:
+                    x_exp = mx.random.normal((256, expert_in_dim)).astype(mx.float32) * 0.1
+                mse_plains, mse_gptqs = [], []
+                for si in sample_idx:
+                    w_orig = w_3d[si].astype(mx.float32)
+                    w_new = new_3d[si].astype(mx.float32)
+                    fo = x_exp @ w_orig.T
+                    pq = mx.dequantize(*mx.quantize(w_orig, group_size=base_gs, bits=base_bits, mode=base_mode),
+                                        group_size=base_gs, bits=base_bits, mode=base_mode)
+                    mp = ((fo - x_exp @ pq.T) ** 2).mean()
+                    mg = ((fo - x_exp @ w_new.T) ** 2).mean()
+                    mx.eval(mp, mg)
+                    mse_plains.append(mp.item())
+                    mse_gptqs.append(mg.item())
+                avg_imp = (1 - sum(mse_gptqs) / max(sum(mse_plains), 1e-20)) * 100
+                logger.debug(
+                    f"    {proj_name}: {avg_imp:+.1f}% improvement, "
+                    f"{_elapsed:.1f}s ({num_experts} experts batched)"
+                )
+
+                if target_type == "module":
+                    target_ref.weight = new_3d
+                else:
+                    container, attr_name = target_ref
+                    setattr(container, attr_name, new_3d)
+
+                layer_opt += 1
+                expert_count += 1
+                del new_3d
+                mx.synchronize()
+                mx.clear_cache()
+
+            del Hinv_mlp
+
+        if layer_opt > 0:
+            optimized_count += layer_opt
+            logger.info(
+                f"oQ{oq_level:g}: L{layer_idx} GPTQ optimized {layer_opt} tensors"
+            )
+
+        del captured
+        out = _forward_layer(block, inputs, layer_mask, position_ids)
+        if out is not None:
+            inputs = out
+        mx.eval(inputs)
+        mx.synchronize()
+        mx.clear_cache()
+
+        elapsed = _time.monotonic() - start_time
+        pct = 30.0 + ((layer_idx + 1) / total_layers) * 25.0
+        if layer_idx > 0 and elapsed > 0:
+            rate = (layer_idx + 1) / elapsed
+            remaining = (total_layers - layer_idx - 1) / rate
+            mins = int(remaining // 60)
+            secs = int(remaining % 60)
+            cb(f"gptq ({layer_idx + 1}/{total_layers}, {mins}:{secs:02d} remaining)", pct)
+        else:
+            cb(f"gptq ({layer_idx + 1}/{total_layers})", pct)
+
+    logger.info(
+        f"oQ{oq_level:g}: GPTQ completed — {optimized_count} tensors "
+        f"({dense_count} dense + {expert_count} expert) across {total_layers} layers"
+    )
 
 
 def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
@@ -1758,403 +2345,6 @@ def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
         bits=bits,
         mode=mode,
     )
-
-
-def _qdq_layers(next_layers, bits: int, group_size: int, mode: str):
-    """Temporarily quantize target layers in the AutoAWQ search objective."""
-    for layer in next_layers:
-        if layer.weight.ndim >= 2:
-            layer.weight = _qdq_weight_only(layer.weight, bits, group_size, mode)
-
-
-def _awq_apply_scaled_qdq(next_layers, scales, bits: int, group_size: int, mode: str):
-    """Apply AutoAWQ-style scaled qdq to the target layers only."""
-    for layer in next_layers:
-        if layer.weight.ndim == 2:
-            scaled_w = layer.weight * scales[None, :]
-            qdq = _qdq_weight_only(scaled_w, bits, group_size, mode)
-            layer.weight = qdq / scales[None, :]
-        elif layer.weight.ndim == 3:
-            scaled_w = layer.weight * scales[None, None, :]
-            qdq = _qdq_weight_only(scaled_w, bits, group_size, mode)
-            layer.weight = qdq / scales[None, None, :]
-
-
-def _build_awq_pairs(block):
-    """Return AWQ search pairs with module-local inputs and outputs.
-
-    CRITICAL: Each smooth_layer (prev_path) MUST appear in exactly ONE pair.
-    Multiple pairs with the same prev_path cause double-scaling of norm weights,
-    breaking mathematical equivalence (norm.weight /= s1 /= s2 while balance
-    layers only have s1 or s2 respectively). Reference: llm-compressor AWQModifier
-    enforces single smooth_layer per mapping.
-    """
-    pairs = []
-
-    is_linear = getattr(block, "is_linear", False)
-
-    if not is_linear and hasattr(block, "self_attn"):
-        attn_paths = [
-            p for p in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
-            if hasattr(block.self_attn, p.split(".")[-1])
-        ]
-        if attn_paths:
-            pairs.append(
-                {
-                    "prev_path": "input_layernorm",
-                    "next_paths": attn_paths,
-                    "stats_input_path": attn_paths[0],
-                    "inspect_kind": "module",
-                    "inspect_path": "self_attn",
-                    "forward_input_path": attn_paths[0],
-                    "use_mask": True,
-                }
-            )
-        attn = block.self_attn
-        if hasattr(attn, "v_proj") and hasattr(attn, "o_proj"):
-            if attn.v_proj.weight.shape[0] == attn.o_proj.weight.shape[-1]:
-                pairs.append(
-                    {
-                        "prev_path": "self_attn.v_proj",
-                        "next_paths": ["self_attn.o_proj"],
-                        "stats_input_path": "self_attn.o_proj",
-                        "inspect_kind": "linear",
-                        "inspect_path": "self_attn.o_proj",
-                        "forward_input_path": "self_attn.o_proj",
-                        "use_mask": False,
-                    }
-                )
-    elif hasattr(block, "linear_attn"):
-        lin_paths = [
-            p for p in (
-                "linear_attn.in_proj_qkv",
-                "linear_attn.in_proj_z",
-                "linear_attn.in_proj_a",
-                "linear_attn.in_proj_b",
-            )
-            if hasattr(block.linear_attn, p.split(".")[-1])
-        ]
-        if lin_paths:
-            pairs.append(
-                {
-                    "prev_path": "input_layernorm",
-                    "next_paths": lin_paths,
-                    "stats_input_path": lin_paths[0],
-                    "inspect_kind": "module",
-                    "inspect_path": "linear_attn",
-                    "forward_input_path": lin_paths[0],
-                    "use_mask": True,
-                }
-            )
-    elif hasattr(block, "self_attn"):
-        attn_paths = [
-            p for p in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
-            if hasattr(block.self_attn, p.split(".")[-1])
-        ]
-        if attn_paths:
-            pairs.append(
-                {
-                    "prev_path": "input_layernorm",
-                    "next_paths": attn_paths,
-                    "stats_input_path": attn_paths[0],
-                    "inspect_kind": "module",
-                    "inspect_path": "self_attn",
-                    "forward_input_path": attn_paths[0],
-                    "use_mask": True,
-                }
-            )
-        attn = block.self_attn
-        if hasattr(attn, "v_proj") and hasattr(attn, "o_proj"):
-            if attn.v_proj.weight.shape[0] == attn.o_proj.weight.shape[-1]:
-                pairs.append(
-                    {
-                        "prev_path": "self_attn.v_proj",
-                        "next_paths": ["self_attn.o_proj"],
-                        "stats_input_path": "self_attn.o_proj",
-                        "inspect_kind": "linear",
-                        "inspect_path": "self_attn.o_proj",
-                        "forward_input_path": "self_attn.o_proj",
-                        "use_mask": False,
-                    }
-                )
-
-    # MUST be a single pair to prevent double-scaling
-    mlp_attr = None
-    for attr in ("mlp", "block_sparse_moe"):
-        if getattr(block, attr, None) is not None:
-            mlp_attr = attr
-            break
-    if mlp_attr is None:
-        return pairs
-    mlp = getattr(block, mlp_attr)
-    p = mlp_attr
-
-    mlp_gate_up_paths = []
-    mlp_inspect_kind = "module"
-    mlp_inspect_path = p
-    mlp_stats_path = None
-
-    se_attr = None
-    if hasattr(mlp, "shared_expert"):
-        se_attr = "shared_expert"
-    elif hasattr(mlp, "shared_experts"):
-        se_attr = "shared_experts"
-    if se_attr and hasattr(getattr(mlp, se_attr), "gate_proj"):
-        mlp_gate_up_paths.extend([
-            f"{p}.{se_attr}.gate_proj",
-            f"{p}.{se_attr}.up_proj",
-        ])
-        if mlp_stats_path is None:
-            mlp_stats_path = f"{p}.{se_attr}.gate_proj"
-
-    if hasattr(mlp, "switch_mlp") and hasattr(mlp, "gate"):
-        mlp_gate_up_paths.extend([
-            f"{p}.switch_mlp.gate_proj",
-            f"{p}.switch_mlp.up_proj",
-        ])
-        if mlp_stats_path is None:
-            mlp_stats_path = f"{p}.gate"
-
-    if not mlp_gate_up_paths and hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
-        mlp_gate_up_paths = [f"{p}.gate_proj", f"{p}.up_proj"]
-        mlp_stats_path = f"{p}.gate_proj"
-
-    if mlp_gate_up_paths and mlp_stats_path:
-        pairs.append(
-            {
-                "prev_path": "post_attention_layernorm",
-                "next_paths": mlp_gate_up_paths,
-                "stats_input_path": mlp_stats_path,
-                "inspect_kind": mlp_inspect_kind,
-                "inspect_path": mlp_inspect_path,
-                "forward_input_path": mlp_stats_path,
-                "use_mask": False,
-            }
-        )
-
-    if se_attr and hasattr(getattr(mlp, se_attr), "up_proj") and hasattr(getattr(mlp, se_attr), "down_proj"):
-        pairs.append(
-            {
-                "prev_path": f"{p}.{se_attr}.up_proj",
-                "next_paths": [f"{p}.{se_attr}.down_proj"],
-                "stats_input_path": f"{p}.{se_attr}.down_proj",
-                "inspect_kind": "linear",
-                "inspect_path": f"{p}.{se_attr}.down_proj",
-                "forward_input_path": f"{p}.{se_attr}.down_proj",
-                "use_mask": False,
-            }
-        )
-
-    if hasattr(mlp, "switch_mlp") and hasattr(mlp, "gate"):
-        sm = mlp.switch_mlp
-        if hasattr(sm, "up_proj") and hasattr(sm, "down_proj"):
-            pairs.append(
-                {
-                    "prev_path": f"{p}.switch_mlp.up_proj",
-                    "next_paths": [f"{p}.switch_mlp.down_proj"],
-                    "stats_input_path": f"{p}.switch_mlp.down_proj",
-                    "inspect_kind": "linear",
-                    "inspect_path": f"{p}.switch_mlp.down_proj",
-                    "forward_input_path": f"{p}.switch_mlp.down_proj",
-                    "use_mask": False,
-                    "usage_source": "router",
-                }
-            )
-    elif hasattr(mlp, "up_proj") and hasattr(mlp, "down_proj"):
-        pairs.append(
-            {
-                "prev_path": f"{p}.up_proj",
-                "next_paths": [f"{p}.down_proj"],
-                "stats_input_path": f"{p}.down_proj",
-                "inspect_kind": "linear",
-                "inspect_path": f"{p}.down_proj",
-                "forward_input_path": f"{p}.down_proj",
-                "use_mask": False,
-            }
-        )
-
-    return pairs
-
-
-def _apply_scale(prev_op, next_layers, scales):
-    """Apply per-channel scaling: prev_op /= scales, next_layers *= scales.
-
-    Handles RMSNorm, LayerNorm, Linear, and fused MoE (SwitchLinear) modules.
-    Math: output is unchanged because scaling cancels out between layers.
-    Preserves original weight dtype to prevent f32 promotion from AWQ scales.
-    """
-    is_norm = isinstance(prev_op, (nn.RMSNorm, nn.LayerNorm)) or (
-        hasattr(prev_op, 'weight') and 'norm' in prev_op.__class__.__name__.lower()
-    )
-    if is_norm:
-        dt = prev_op.weight.dtype
-        prev_op.weight = (prev_op.weight / scales).astype(dt)
-        if hasattr(prev_op, 'bias') and prev_op.bias is not None:
-            prev_op.bias = (prev_op.bias / scales).astype(dt)
-        for layer in next_layers:
-            dt = layer.weight.dtype
-            if layer.weight.ndim == 2:
-                layer.weight = (layer.weight * scales).astype(dt)
-            elif layer.weight.ndim == 3:
-                layer.weight = (layer.weight * scales[None, None, :]).astype(dt)
-    elif hasattr(prev_op, 'weight'):
-        dt = prev_op.weight.dtype
-        if prev_op.weight.ndim == 2:
-            prev_op.weight = (prev_op.weight / scales[:, None]).astype(dt)
-        elif prev_op.weight.ndim == 3:
-            prev_op.weight = (prev_op.weight / scales[None, :, None]).astype(dt)
-        if hasattr(prev_op, 'bias') and prev_op.bias is not None:
-            prev_op.bias = (prev_op.bias / scales).astype(dt)
-        for layer in next_layers:
-            dt = layer.weight.dtype
-            if layer.weight.ndim == 2:
-                layer.weight = (layer.weight * scales).astype(dt)
-            elif layer.weight.ndim == 3:
-                layer.weight = (layer.weight * scales[None, None, :]).astype(dt)
-
-
-def _weight_mean(next_layers, expert_usage=None):
-    """Compute per-input-channel weight magnitude across next layers."""
-    w_scales = []
-    for layer in next_layers:
-        w = layer.weight
-        if w.ndim == 2:
-            w_norm = w.abs() / (w.abs().max(axis=1, keepdims=True) + 1e-6)
-            w_scales.append(w_norm.mean(axis=0))
-        elif w.ndim == 3:
-            w_norm = w.abs() / (w.abs().max(axis=2, keepdims=True) + 1e-6)
-            if expert_usage is not None and expert_usage.shape[0] == w_norm.shape[0]:
-                usage = expert_usage.astype(w_norm.dtype)
-                weighted = (w_norm * usage[:, None, None]).sum(axis=0)
-                w_scales.append(weighted.mean(axis=0))
-            else:
-                w_scales.append(w_norm.mean(axis=(0, 1)))
-    if not w_scales:
-        return None
-    result = w_scales[0]
-    for ws in w_scales[1:]:
-        result = mx.maximum(result, ws)
-    return result
-
-
-def _run_awq_pair_output(block, pair, captured, layer_mask, position_ids=None):
-    """Replay the exact inspected submodule output for an AWQ pair."""
-    inspect_kind = pair["inspect_kind"]
-
-    if inspect_kind == "module":
-        inspect_module = _resolve_submodule(block, pair["inspect_path"])
-        forward_input = captured[pair["forward_input_path"]]
-        kwargs = {"mask": layer_mask} if pair.get("use_mask") else {}
-        if position_ids is not None:
-            try:
-                return inspect_module(
-                    forward_input.value,
-                    position_ids=position_ids,
-                    **kwargs,
-                )
-            except TypeError:
-                pass
-        return inspect_module(forward_input.value, **kwargs)
-
-    if inspect_kind == "linear":
-        inspect_module = _resolve_submodule(block, pair["inspect_path"])
-        forward_input = captured[pair["forward_input_path"]]
-        return _forward_captured_module(inspect_module, forward_input)
-
-    if inspect_kind == "routed_moe":
-        mlp = _resolve_submodule(block, pair["inspect_path"])
-        forward_input = captured[pair["forward_input_path"]]
-        routed, usage = _forward_sparse_moe_routed(mlp, forward_input.value)
-        return routed, usage
-
-    raise ValueError(f"Unknown AWQ inspect kind: {inspect_kind}")
-
-
-def _run_awq_pair_search(
-    block,
-    pair,
-    captured,
-    layer_mask,
-    position_ids,
-    bits: int,
-    group_size: int,
-    mode: str,
-    n_grid: int,
-):
-    """Search the best AutoAWQ scale for a single pair."""
-    stats_input = captured.get(pair["stats_input_path"])
-    if stats_input is None:
-        return None
-
-    next_layers = [_resolve_submodule(block, path) for path in pair["next_paths"]]
-    if any(layer.weight.shape[-1] % group_size != 0 for layer in next_layers):
-        return None
-    prev_op = _resolve_submodule(block, pair["prev_path"])
-    orig_next_weights = [layer.weight for layer in next_layers]
-
-    float_out = _run_awq_pair_output(
-        block, pair, captured, layer_mask, position_ids=position_ids
-    )
-    expert_usage = None
-    if pair["inspect_kind"] == "routed_moe":
-        float_out, expert_usage = float_out
-
-    _qdq_layers(next_layers, bits=bits, group_size=group_size, mode=mode)
-    quant_out = _run_awq_pair_output(
-        block, pair, captured, layer_mask, position_ids=position_ids
-    )
-    if pair["inspect_kind"] == "routed_moe":
-        quant_out, _ = quant_out
-    baseline_loss = ((float_out - quant_out) ** 2).mean()
-    mx.eval(baseline_loss)
-    best_error = baseline_loss.item()
-    best_scales = None
-    for layer, ow in zip(next_layers, orig_next_weights):
-        layer.weight = ow
-
-    x_mean = _captured_mean_abs(stats_input.value)
-    w_mean = _weight_mean(next_layers, expert_usage=expert_usage)
-    if w_mean is None or x_mean.shape[0] != w_mean.shape[0]:
-        return None
-
-    for ratio_i in range(n_grid):
-        r = ratio_i / n_grid
-        scales = mx.maximum(x_mean**r / (w_mean ** (1 - r) + 1e-4), 1e-4)
-        scales = scales / mx.sqrt(scales.max() * scales.min())
-        scales = mx.where(mx.isinf(scales) | mx.isnan(scales), 1.0, scales)
-        scales = mx.maximum(scales, 1e-5)
-
-        _awq_apply_scaled_qdq(next_layers, scales, bits=bits, group_size=group_size, mode=mode)
-        scaled_out = _run_awq_pair_output(
-            block, pair, captured, layer_mask, position_ids=position_ids
-        )
-        if pair["inspect_kind"] == "routed_moe":
-            scaled_out, _ = scaled_out
-        loss = ((float_out - scaled_out) ** 2).mean()
-        mx.eval(loss)
-        if loss.item() < best_error:
-            best_error = loss.item()
-            best_scales = scales
-        del scaled_out, loss
-        for layer, ow in zip(next_layers, orig_next_weights):
-            layer.weight = ow
-
-    prev_path = pair.get("prev_path", "?")
-    next_desc = ",".join(p.split(".")[-1] for p in pair["next_paths"])
-    if best_scales is not None:
-        improvement = (1 - best_error / max(baseline_loss.item(), 1e-10)) * 100
-        logger.debug(
-            f"  AWQ {prev_path} -> [{next_desc}]: "
-            f"MSE {baseline_loss.item():.6f} -> {best_error:.6f} ({improvement:+.1f}%)"
-        )
-        _apply_scale(prev_op, next_layers, best_scales)
-        mx.eval(block.parameters())
-    else:
-        logger.debug(
-            f"  AWQ {prev_path} -> [{next_desc}]: no improvement (baseline {baseline_loss.item():.6f})"
-        )
-
-    return best_scales
 
 
 def _temporary_quantize_block(block, config, oq_level, group_size: int):
@@ -2396,260 +2586,6 @@ def _measure_sensitivity_from_quantized_model(
     return sensitivity
 
 
-def _run_equalization_and_sensitivity(
-    model, tokenizer, config, oq_level,
-    progress_callback=None,
-    calib_dataset="code_multilingual",
-    num_samples=32, seq_length=256,
-    n_grid=10,
-):
-    """Run AutoAWQ-style weight equalization + per-layer sensitivity measurement.
-
-    For each layer:
-    1. Float forward (baseline output)
-    2. Grid search over scaling ratios (duo_scaling formula)
-       - For each ratio: scale weights → quantize → forward → MSE
-       - Pick ratio that minimizes output MSE
-       - Only apply if MSE improves over no scaling
-    3. Measure quantization sensitivity (quantize→dequantize→MSE)
-
-    Args:
-        model: Loaded model (float weights).
-        tokenizer: Tokenizer for calibration.
-        config: Model config dict.
-        oq_level: Target oQ level.
-        n_grid: Number of grid search steps per scale pair.
-
-    Returns:
-        Dict of {layer_idx: sensitivity_score}.
-    """
-    cb = progress_callback or (lambda phase, pct: None)
-
-    calib_data = _load_calibration_data(
-        tokenizer, dataset=calib_dataset,
-        num_samples=num_samples, seq_length=seq_length,
-    )
-    if calib_data is None:
-        return {}
-
-    embed_fn, layers = _find_model_layers(model)
-    if embed_fn is None or layers is None:
-        logger.warning("Cannot find model layers, skipping equalization")
-        return {}
-
-    inputs = embed_fn(calib_data)
-    layer_masks = _layer_masks_for_model(model, layers, inputs)
-    position_ids = mx.arange(calib_data.shape[1])[None, :]
-    sensitivity = {}
-    total_layers = len(layers)
-    equalized_count = 0
-    start_time = _time.monotonic()
-
-    for layer_idx, block in enumerate(layers):
-        layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
-        out_float, captured = _capture_block_module_inputs(
-            block, inputs, layer_mask, position_ids
-        )
-        if out_float is None:
-            logger.warning(f"Equalization: layer {layer_idx} forward failed, skipping")
-            continue
-
-        awq_pairs = _build_awq_pairs(block)
-        layer_eq = 0
-        for pair in awq_pairs:
-            bits, gs, mode = _get_predicate_bits(
-                pair["next_paths"][0], config, oq_level, _OQ_DEFAULT_GROUP_SIZE
-            )
-            if bits is None or bits < 4:
-                continue
-            scales = _run_awq_pair_search(
-                block,
-                pair,
-                captured,
-                layer_mask,
-                position_ids,
-                bits=bits,
-                group_size=gs,
-                mode=mode,
-                n_grid=n_grid,
-            )
-            if scales is not None:
-                equalized_count += 1
-                layer_eq += 1
-                del captured
-                mx.synchronize()
-                mx.clear_cache()
-                out_float, captured = _capture_block_module_inputs(
-                    block, inputs, layer_mask, position_ids
-                )
-                mx.eval(out_float)
-                if out_float is None:
-                    break
-            else:
-                mx.synchronize()
-                mx.clear_cache()
-        if layer_eq > 0 or layer_idx % 10 == 0:
-            logger.info(
-                f"oQ{oq_level:g}: L{layer_idx} equalized {layer_eq}/{len(awq_pairs)} pairs"
-            )
-
-        del captured
-        mx.synchronize()
-        mx.clear_cache()
-
-        out_eq_float = _forward_layer(block, inputs, layer_mask, position_ids)
-        if out_eq_float is None:
-            out_eq_float = out_float
-        mx.eval(out_eq_float)
-
-        saved_weights = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
-        )
-        out_quant = _forward_layer(block, inputs, layer_mask, position_ids)
-        if out_quant is not None:
-            raw_mse = ((out_eq_float - out_quant) ** 2).mean()
-            out_magnitude = (out_eq_float ** 2).mean()
-            mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
-            mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
-
-        _restore_saved_weights(block, saved_weights)
-        del out_quant, saved_weights
-
-        inputs = out_eq_float
-        del out_eq_float, out_float
-        mx.eval(inputs)
-        mx.synchronize()
-        mx.clear_cache()
-
-        elapsed = _time.monotonic() - start_time
-        pct = 5.0 + ((layer_idx + 1) / total_layers) * 20.0
-        if layer_idx > 0 and elapsed > 0:
-            rate = (layer_idx + 1) / elapsed
-            remaining = (total_layers - layer_idx - 1) / rate
-            mins = int(remaining // 60)
-            secs = int(remaining % 60)
-            cb(f"equalizing ({layer_idx + 1}/{total_layers}, {mins}:{secs:02d} remaining)", pct)
-        else:
-            cb(f"equalizing ({layer_idx + 1}/{total_layers})", pct)
-
-    logger.info(
-        f"oQ{oq_level:g}: equalized {equalized_count} AWQ pairs, "
-        f"measured sensitivity for {len(sensitivity)} layers"
-    )
-    if sensitivity:
-        ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
-        logger.info(f"oQ{oq_level:g}: layer sensitivity (descending): "
-                     + ", ".join(f"L{i}={s:.4f}" for i, s in ranked))
-
-    return sensitivity
-
-
-def _run_clip_optimization(model, tokenizer, config, oq_level,
-                           progress_callback=None, clip_batch_size=1024,
-                           calib_dataset="code_multilingual",
-                           num_samples=_CLIP_NUM_SAMPLES,
-                           seq_length=_CLIP_SEQ_LENGTH):
-    """Run AWQ-style clip optimization on the model before quantization.
-
-    Layer-by-layer forward pass with calibration data, then per-layer
-    clip search for layers that will get <=4 bits. Modifies weights in-place.
-
-    Args:
-        model: Loaded model (float weights).
-        tokenizer: Tokenizer for calibration data.
-        config: Model config dict.
-        oq_level: Target oQ level.
-        progress_callback: Optional fn(phase, pct).
-
-    Returns:
-        Number of layers optimized.
-    """
-    cb = progress_callback or (lambda phase, pct: None)
-
-    calib_data = _load_calibration_data(
-        tokenizer, dataset=calib_dataset,
-        num_samples=num_samples, seq_length=seq_length,
-    )
-    if calib_data is None:
-        return 0
-
-    embed_fn, layers = _find_model_layers(model)
-    if embed_fn is None or layers is None:
-        logger.warning("Cannot find embedding layer, skipping clip optimization")
-        return 0
-
-    inputs = embed_fn(calib_data)
-    layer_masks = _layer_masks_for_model(model, layers, inputs)
-    position_ids = mx.arange(calib_data.shape[1])[None, :]
-    optimized = 0
-    total_layers = len(layers)
-    clip_candidates = 0
-    opt_start = _time.monotonic()
-
-    for layer_idx, block in enumerate(layers):
-        layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
-        outputs, captured = _capture_block_module_inputs(
-            block, inputs, layer_mask, position_ids
-        )
-        if outputs is None:
-            logger.warning(
-                f"Clip optimization: layer {layer_idx} forward failed, skipping"
-            )
-            continue
-
-        for path, module in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
-            if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
-                continue
-            if module.__class__.__name__ == "SwitchLinear":
-                continue
-            norm_path = _normalize_quant_path(path)
-            bits, gs, mode = _get_predicate_bits(
-                norm_path, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
-            )
-            if bits is None or bits > _CLIP_MAX_BITS:
-                continue
-            if norm_path.endswith(("q_proj", "k_proj")):
-                continue
-            clip_candidates += 1
-            captured_input = captured.get(norm_path)
-            if captured_input is None or captured_input.indices is not None:
-                continue
-            if module.weight.shape[-1] != captured_input.value.shape[-1]:
-                continue
-            if module.weight.shape[-1] % gs != 0:
-                continue
-            module.weight = _search_best_clip(
-                module.weight,
-                captured_input.value,
-                group_size=gs,
-                bits=bits,
-                mode=mode,
-                batch_size=clip_batch_size,
-            )
-            optimized += 1
-
-        inputs = outputs
-        mx.synchronize()
-        mx.clear_cache()
-
-        elapsed = _time.monotonic() - opt_start
-        pct = 30.0 + ((layer_idx + 1) / total_layers) * 30.0
-        if layer_idx > 0 and elapsed > 0:
-            rate = (layer_idx + 1) / elapsed
-            remaining = (total_layers - layer_idx - 1) / rate
-            mins = int(remaining // 60)
-            secs = int(remaining % 60)
-            cb(f"optimizing ({layer_idx + 1}/{total_layers}, {mins}:{secs:02d} remaining)", pct)
-        else:
-            cb(f"optimizing ({layer_idx + 1}/{total_layers})", pct)
-
-    logger.info(
-        f"oQ{oq_level:g}: clip-optimized {optimized}/{clip_candidates} candidates"
-    )
-    return optimized
-
-
 
 
 def quantize_oq(
@@ -2665,14 +2601,14 @@ def quantize_oq(
     clip_seq_length: int = _CLIP_SEQ_LENGTH,
     target_bpw: float | None = None,
     hard_cap_bpw: float | None = None,
-    n_grid: int = 10,
     sensitivity_model_path: str = "",
+    **kwargs,
 ) -> None:
-    """Run oQ quantization: load -> clip-optimize -> quantize -> save.
+    """Run oQ quantization: load -> GPTQ optimize -> quantize -> save.
 
     Pipeline:
         1. Load model (float weights)
-        2. (Optional) AWQ-style clip optimization for <=4 bit layers
+        2. (Optional) GPTQ weight optimization with calibration data
         3. quantize_model() with universal predicate
         4. Save
 
@@ -2680,7 +2616,7 @@ def quantize_oq(
         model_path: Path to source model directory.
         output_path: Path for output (must not exist).
         oq_level: Quantization level (2, 3, 4, 6, or 8).
-        enable_clip_optimization: Run AWQ-style clip search (requires calibration data).
+        enable_clip_optimization: Run GPTQ optimization (requires calibration data).
         progress_callback: Optional fn(phase_name, progress_pct) for updates.
     """
     from mlx_lm.utils import quantize_model
@@ -2733,11 +2669,16 @@ def quantize_oq(
                 seq_length=clip_seq_length,
             )
         else:
-            logger.info(f"oQ{oq_level:g}: measuring layer sensitivity (pre-AWQ)")
+            # Sensitivity only needs layer ranking — short sequences with
+            # more samples give diverse activation coverage and run faster
+            # (embedding computed once, each layer forward is shorter).
+            _sens_samples = min(clip_num_samples * 2, 256)
+            _sens_seqlen = min(clip_seq_length, 128)
+            logger.info(f"oQ{oq_level:g}: measuring layer sensitivity")
             sensitivity_map = _measure_sensitivity_from_model(
                 model, tokenizer, config, oq_level,
-                calib_dataset, num_samples=clip_num_samples,
-                seq_length=clip_seq_length,
+                calib_dataset, num_samples=_sens_samples,
+                seq_length=_sens_seqlen,
             )
         if sensitivity_map:
             config["_oq_sensitivity_map"] = {
@@ -2765,20 +2706,13 @@ def quantize_oq(
         config["_oq_boost_map"] = {}
 
     if enable_clip_optimization:
-        cb("equalizing", 15.0)
-        logger.info(f"oQ{oq_level:g}: running AWQ weight equalization")
-        _run_equalization_and_sensitivity(
+        cb("gptq", 15.0)
+        logger.info(f"oQ{oq_level:g}: running GPTQ weight optimization")
+        _run_gptq(
             model, tokenizer, config, oq_level, cb,
             calib_dataset, num_samples=clip_num_samples,
-            seq_length=clip_seq_length, n_grid=n_grid,
+            seq_length=clip_seq_length,
         )
-
-    if False and enable_clip_optimization and oq_level <= _CLIP_MAX_BITS:
-        cb("optimizing", 30.0)
-        logger.info(f"oQ{oq_level:g}: running clip optimization")
-        _run_clip_optimization(model, tokenizer, config, oq_level, cb,
-                               clip_batch_size, calib_dataset,
-                               clip_num_samples, clip_seq_length)
 
     cb("quantizing", 60.0)
 

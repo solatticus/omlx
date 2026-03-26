@@ -1076,13 +1076,13 @@
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.level') }}</label>
                                         <select x-model.number="oqLevel"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? '+' : '')">oQ2</option>
-                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? '+' : '')">oQ3</option>
-                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? '+' : '')">oQ3.5</option>
-                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? '+' : '')">oQ4</option>
-                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? '+' : '')">oQ5</option>
-                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? '+' : '')">oQ6</option>
-                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? '+' : '')">oQ8</option>
+                                            <option value="2" x-text="'oQ2' + (oqEnableClip ? 'e' : '')">oQ2</option>
+                                            <option value="3" x-text="'oQ3' + (oqEnableClip ? 'e' : '')">oQ3</option>
+                                            <option value="3.5" x-text="'oQ3.5' + (oqEnableClip ? 'e' : '')">oQ3.5</option>
+                                            <option value="4" selected x-text="'oQ4' + (oqEnableClip ? 'e' : '')">oQ4</option>
+                                            <option value="5" x-text="'oQ5' + (oqEnableClip ? 'e' : '')">oQ5</option>
+                                            <option value="6" x-text="'oQ6' + (oqEnableClip ? 'e' : '')">oQ6</option>
+                                            <option value="8" x-text="'oQ8' + (oqEnableClip ? 'e' : '')">oQ8</option>
                                         </select>
                                     </div>
                                     <!-- Start Button -->
@@ -1110,10 +1110,10 @@
                                         {{ t('models.oq.advanced_settings') }}
                                     </button>
                                     <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
-                                        <!-- Clip Optimization -->
+                                        <!-- Enhanced Quantization(+) -->
                                         <div class="flex items-center justify-between">
                                             <div class="flex items-center gap-2">
-                                                <span class="text-sm text-neutral-600">{{ t('models.oq.clip_optimization') }}</span>
+                                                <span class="text-sm text-neutral-600">Enhanced Quantization(+)</span>
                                                 <span x-show="!oqSelectedModelSupportsClip()" x-cloak
                                                       class="text-[10px] text-neutral-400">(not available for this model)</span>
                                             </div>
@@ -1127,10 +1127,10 @@
                                             </button>
                                         </div>
                                         <p x-show="oqEnableClip" x-cloak class="text-xs text-amber-600 leading-relaxed">
-                                            {{ t('models.oq.clip_description') }}
+                                            Uses oQ's MoE-optimized <a href="https://arxiv.org/abs/2210.17323" target="_blank" class="underline">GPTQ(arXiv)</a> with batched expert processing and sensitivity-aware bit allocation. Requires full model load.
                                         </p>
                                         <p class="text-[11px] text-neutral-400 leading-relaxed">
-                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Ministral3.
+                                            Supported: Qwen3.5 MoE, Qwen3.5, MiniMax M2, GLM MoE, Nemotron, Step-3.5.
                                         </p>
                                         <!-- Text Only (VLM only) -->
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
@@ -1146,16 +1146,6 @@
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
                                             Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
                                         </p>
-                                        <!-- Group Size -->
-                                        <div class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">{{ t('models.oq.group_size') }}</span>
-                                            <select x-model.number="oqGroupSize"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="32">32</option>
-                                                <option value="64" selected>64</option>
-                                                <option value="128">128</option>
-                                            </select>
-                                        </div>
                                         <!-- Calibration Dataset (clip ON only) -->
                                         <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.calib_dataset') }}</span>
@@ -1186,15 +1176,6 @@
                                                 <option value="256">256</option>
                                                 <option value="512" selected>512</option>
                                                 <option value="1024">1024</option>
-                                            </select>
-                                        </div>
-                                        <!-- AWQ Grid Size (clip ON only) -->
-                                        <div x-show="oqEnableClip" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">AWQ Grid Size</span>
-                                            <select x-model.number="oqNGrid"
-                                                    class="px-3 py-1.5 bg-white border border-neutral-300 rounded-lg text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="10" selected>10 (fast)</option>
-                                                <option value="20">20 (recommended, slow)</option>
                                             </select>
                                         </div>
                                     </div>
@@ -1795,13 +1776,21 @@
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
                                             {{ t('models.detail.close') }}
                                         </button>
-                                        <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
-                                                :disabled="hfDownloading"
-                                                class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
-                                                       disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
-                                            <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                            {{ t('models.downloader.download_button') }}
-                                        </button>
+                                        <template x-if="hfModelDetail.is_adapter">
+                                            <span class="px-4 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-1.5">
+                                                <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>
+                                                {{ t('models.detail.lora_warning') }}
+                                            </span>
+                                        </template>
+                                        <template x-if="!hfModelDetail.is_adapter">
+                                            <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
+                                                    :disabled="hfDownloading"
+                                                    class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
+                                                           disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+                                                <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                                                {{ t('models.downloader.download_button') }}
+                                            </button>
+                                        </template>
                                     </div>
                                 </div>
                             </div>

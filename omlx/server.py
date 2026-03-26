@@ -220,6 +220,7 @@ class ServerState:
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     session_manager: Optional[object] = None  # SessionManager
+    oq_manager: Optional[object] = None  # OQManager
 
 
 # Global server state instance
@@ -244,11 +245,13 @@ def get_mcp_manager():
 
 
 async def verify_api_key(
+    request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
     """Verify API key if configured.
 
     Checks the provided Bearer token against the main API key and all sub keys.
+    Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import verify_any_api_key
 
@@ -264,9 +267,14 @@ async def verify_api_key(
     ):
         return True
 
-    # Check if credentials provided
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="API key required")
+    # Extract API key from Bearer token or x-api-key header
+    if credentials is not None:
+        api_key_value = credentials.credentials
+    else:
+        # Fallback: check x-api-key header (Anthropic SDK compatibility)
+        api_key_value = request.headers.get("x-api-key")
+        if api_key_value is None:
+            raise HTTPException(status_code=401, detail="API key required")
 
     # Check main key and sub keys
     sub_keys = (
@@ -274,10 +282,8 @@ async def verify_api_key(
         if _server_state.global_settings is not None
         else []
     )
-    if not verify_any_api_key(
-        credentials.credentials, _server_state.api_key, sub_keys
-    ):
-        logger.warning("Rejected API key: %r", credentials.credentials)
+    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
+        logger.warning("Rejected API key: %r", api_key_value)
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
@@ -2860,7 +2866,6 @@ async def create_anthropic_message(
         request.temperature, request.top_p, request.model,
         req_max_tokens=request.max_tokens,
     )
-    max_tokens = clamp_max_tokens(max_tokens, num_prompt_tokens, request.model)
 
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -2920,6 +2925,8 @@ async def create_anthropic_message(
             )
         raise
     validate_context_window(num_prompt_tokens, request.model)
+    max_tokens = clamp_max_tokens(max_tokens, num_prompt_tokens, request.model)
+    chat_kwargs["max_tokens"] = max_tokens
 
     # Add stop sequences
     if request.stop_sequences:

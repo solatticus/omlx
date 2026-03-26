@@ -400,13 +400,13 @@ class TestMessagesRequest:
                 messages=[AnthropicMessage(role="user", content="Hello")],
             )
 
-    def test_request_model_required(self):
-        """Test that model is required."""
-        with pytest.raises(ValidationError):
-            MessagesRequest(
-                max_tokens=1024,
-                messages=[AnthropicMessage(role="user", content="Hello")],
-            )
+    def test_request_model_defaults_to_none(self):
+        """Test that model defaults to None (server uses default model)."""
+        req = MessagesRequest(
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+        assert req.model is None
 
     def test_request_messages_required(self):
         """Test that messages is required."""
