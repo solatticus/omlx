@@ -358,6 +358,10 @@ def _tq_sdpa_2pass_1_kernel():
             max_score = new_max;
             sum_exp = sum_exp * factor + exp_score;
 
+            // Sparse-V guard: skip V dequant when contribution is negligible
+            // (~90%+ of positions skipped at 32K+ context)
+            if (exp_score < 1e-6f) continue;
+
             auto v_ptr = v_base + t * VPackedWidth;
             float v_norm = static_cast<float>(vn_base[t]);
             for (int j = 0; j < QK_PER_THREAD; j++) {
