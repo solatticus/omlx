@@ -271,14 +271,32 @@ class MedusaHeads(nn.Module):
         ]
 
     def init_from_lm_head(self):
-        """Initialize Medusa heads from the original LM head (scaled down)."""
+        """Initialize Medusa heads from the original LM head (scaled down).
+
+        Falls back to Xavier init if the LM head is quantized (packed weights).
+        """
         if self._tied:
             lm_weight = self._inner.embed_tokens.weight
         else:
             lm_weight = self.lm_head.weight
-        for head in self.medusa_heads:
-            head.weight = lm_weight * 0.1
-        logger.info(f"Medusa: initialized {self.num_heads} heads from LM head")
+
+        hidden_size = self._lm.args.hidden_size
+        vocab_size = self._lm.args.vocab_size
+        expected_shape = (vocab_size, hidden_size)
+
+        if lm_weight.shape == expected_shape:
+            for head in self.medusa_heads:
+                head.weight = lm_weight * 0.1
+            logger.info(f"Medusa: initialized {self.num_heads} heads from LM head")
+        else:
+            # Quantized model: LM head weights are packed, use Xavier init
+            scale = (2.0 / (hidden_size + vocab_size)) ** 0.5
+            for head in self.medusa_heads:
+                head.weight = mx.random.normal(expected_shape) * scale
+            logger.info(
+                f"Medusa: Xavier-initialized {self.num_heads} heads "
+                f"(LM head is quantized, shape {lm_weight.shape} != {expected_shape})"
+            )
 
     def load_heads(self, path: str):
         """Load pre-trained Medusa head weights."""
