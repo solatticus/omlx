@@ -3871,6 +3871,19 @@ Note: Use the omlx CLI for full feature support.
         default=32768,
         help="Default max tokens for generation",
     )
+    parser.add_argument(
+        "--speculative",
+        type=str,
+        default=None,
+        choices=["recurrent"],
+        help="Speculative decoding method (recurrent = ReDrafter tree-based)",
+    )
+    parser.add_argument(
+        "--speculative-drafter-path",
+        type=str,
+        default=None,
+        help="Path to ReDrafter drafter weights directory",
+    )
 
     args = parser.parse_args()
 

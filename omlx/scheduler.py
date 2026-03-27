@@ -972,6 +972,12 @@ class SchedulerConfig:
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
+    # Speculative decoding (ReDrafter tree-based)
+    speculative: Optional[str] = None  # None | recurrent (ReDrafter)
+    speculative_drafter_path: Optional[str] = None  # Path to drafter weights
+    speculative_beam_width: int = 3   # 2-4 optimal on M-series
+    speculative_beam_length: int = 5  # Tokens per beam
+
 
 @dataclass
 class SchedulerOutput:
