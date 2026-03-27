@@ -977,6 +977,8 @@ class SchedulerConfig:
     speculative_drafter_path: Optional[str] = None  # Path to drafter weights
     speculative_beam_width: int = 3   # 2-4 optimal on M-series
     speculative_beam_length: int = 5  # Tokens per beam
+    medusa_num_heads: int = 4  # Number of Medusa speculation heads
+    medusa_heads_path: Optional[str] = None  # Path to trained Medusa head weights
 
 
 @dataclass

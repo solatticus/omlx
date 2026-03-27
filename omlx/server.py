@@ -3875,7 +3875,7 @@ Note: Use the omlx CLI for full feature support.
         "--speculative",
         type=str,
         default=None,
-        choices=["recurrent"],
+        choices=["medusa", "recurrent"],
         help="Speculative decoding method (recurrent = ReDrafter tree-based)",
     )
     parser.add_argument(
